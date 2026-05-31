@@ -15,7 +15,6 @@
 ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
 ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠙⠇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
 ```
-
 # Pintail
 
 > **A terminal admin console for [Quack](https://duckdb.org) and
@@ -62,7 +61,107 @@ verification queries (does the token work? what's the row count after
 rollback? are sessions live?) without leaving the admin tool. For real
 exploration work, reach for Harlequin or DuckDB's local UI.
 
-## Three connection types
+## Getting started — a real setup
+
+Pintail ships with **no mock data**. The default config has one stub
+connection (`localhost` → `quack://localhost:9494`) that won't connect to
+anything until you stand up a real backend behind it. The dashboard's
+"active connections" panel and DuckLake catalog panel will be empty until
+that happens — which is honest, not broken.
+
+Here are the three shortest paths to a useful setup.
+
+### 1. Point at a local `.duckdb` file (zero infrastructure)
+
+If you already have a `.duckdb` file with data in it — the fastest start.
+Create one in a few seconds if not:
+
+```bash
+duckdb /tmp/test.duckdb -c "
+CREATE TABLE events AS
+  SELECT range::INTEGER AS id,
+         (random() * 1000)::INTEGER AS user_id,
+         now() - INTERVAL (random() * 30) DAY AS ts
+  FROM range(10000);
+"
+```
+
+Then in Pintail:
+- Press `a` to open the connection manager
+- `shift+→` until the type chip reads **Local**
+- Name: `mydb`,  Path: `/tmp/test.duckdb`
+- `enter` to save
+
+The dashboard now shows `● mydb online` and the scratchpad runs queries
+against the real file.
+
+### 2. Stand up a local DuckLake (catalog + storage)
+
+For exercising the DuckLake-specific features (snapshots, time-travel,
+storage secrets), bootstrap a local lake — catalog on disk, data on disk,
+no S3 needed:
+
+```bash
+mkdir -p /tmp/lake/data
+duckdb /tmp/lake/catalog.duckdb -c "
+INSTALL ducklake; LOAD ducklake;
+ATTACH 'ducklake:/tmp/lake/catalog.duckdb' AS lake (DATA_PATH '/tmp/lake/data');
+USE lake;
+CREATE TABLE orders AS
+  SELECT range AS order_id, (random() * 500)::INTEGER AS amount
+  FROM range(5000);
+CREATE TABLE customers AS
+  SELECT range AS id, 'user_' || range AS name
+  FROM range(500);
+"
+```
+
+Then add a DuckLake connection in Pintail:
+- Press `a`,  `shift+→` until type is **DuckLake**
+- Catalog path: `/tmp/lake/catalog.duckdb`
+- Storage: `/tmp/lake/data`
+
+The snapshots screen (`l`) now lists real snapshots; the catalog panel
+populates from `information_schema.tables`; queries actually return rows.
+
+### 3. Quack server — read the docs
+
+A "real" Quack server (the multi-writer DuckDB-as-a-service deployment
+that Pintail was originally built for) is a more involved setup — it
+typically means running a process exposing the Quack protocol on a
+host:port that other DuckDB clients can attach to. The setup steps for
+that depend on which Quack server implementation you're using (the
+official DuckDB Quack extension, [quacklake](https://github.com/tobilg/quacklake)
+on Cloudflare Workers, or one you've built). Once you have one running:
+
+- Press `a`, keep type as **Quack**
+- Host: `your-server` , Port: `9494` (or whatever)
+- Token: paste the bearer credential the server expects
+- TLS: `y` if it's behind HTTPS termination
+
+Then for production deployments, the **TLS config** (`x`) and **Auth
+policy** (`p`) screens become useful: the former generates Caddy/Nginx/
+Envoy reverse-proxy configs with the required `h2c` upgrade, the latter
+manages per-token grants via `ALTER SECRET`.
+
+### Bootstrapping the config file directly
+
+If you'd rather skip the form, just write `~/.duckdb/pintail.json` by
+hand. Pintail loads it on startup:
+
+```json
+{
+  "servers": [
+    { "name": "mydb",      "type": "local",    "path": "/tmp/test.duckdb" },
+    { "name": "lake-dev",  "type": "ducklake", "catalog_path": "/tmp/lake/catalog.duckdb", "storage_path": "/tmp/lake/data" }
+  ],
+  "storage_secrets": []
+}
+```
+
+Both forms produce the same in-memory state.
+
+
 
 Each configured connection has a `type` and the client adapts its ping,
 query routing, and metadata fetch accordingly.

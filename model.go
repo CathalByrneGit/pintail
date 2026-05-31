@@ -631,6 +631,31 @@ func (m Model) updateAddServer(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case "shift+left":
+		// Cycle type backwards from anywhere in the form (any field, type row,
+		// or even the connection list). Clamps focus to a valid field for the
+		// new type so we don't end up out-of-bounds when types have different
+		// field counts.
+		for i := 0; i < len(AllConnTypes)-1; i++ {
+			f.connType = f.connType.Next()
+		}
+		if f.focusIdx >= 0 {
+			if visible := f.visibleFields(); f.focusIdx >= len(visible) {
+				f.focusIdx = len(visible) - 1
+			}
+		}
+		return m, nil
+
+	case "shift+right":
+		// Cycle type forward from anywhere in the form.
+		f.connType = f.connType.Next()
+		if f.focusIdx >= 0 {
+			if visible := f.visibleFields(); f.focusIdx >= len(visible) {
+				f.focusIdx = len(visible) - 1
+			}
+		}
+		return m, nil
+
 	case "right", " ":
 		if f.focusIdx == -1 {
 			f.connType = f.connType.Next()
@@ -821,6 +846,23 @@ func (m Model) viewConnectionsPanel(width, height int) string {
 func (m Model) viewCatalogPanel(width, height int) string {
 	var lines []string
 	lines = append(lines, labelStyle.Render("DUCKLAKE CATALOG"), "")
+
+	if len(m.catalog) == 0 {
+		lines = append(lines,
+			mutedStyle.Render("  ◌ no catalog data"),
+			"",
+			mutedStyle.Render("  populates from information_schema.tables"),
+			mutedStyle.Render("  when a connection comes online"),
+			"",
+			mutedStyle.Render("  see README §Getting started"),
+		)
+		style := panelStyle
+		if m.focus == panelCatalog {
+			style = activePanelStyle
+		}
+		return style.Width(width - 2).Height(height - 1).Render(strings.Join(lines, "\n"))
+	}
+
 	for _, schema := range m.catalog {
 		arrow := "▶"
 		if schema.Open {
@@ -842,12 +884,6 @@ func (m Model) viewCatalogPanel(width, height int) string {
 		}
 		lines = append(lines, "")
 	}
-	sep := mutedStyle.Render(strings.Repeat("─", width-6))
-	lines = append(lines, sep,
-		mutedStyle.Render("object store  ")+greenStyle.Render("s3://datalake-prod"),
-		mutedStyle.Render("catalog db    ")+greenStyle.Render("● connected"),
-		mutedStyle.Render("parquet files ")+brightStyle.Render("847"),
-	)
 	style := panelStyle
 	if m.focus == panelCatalog {
 		style = activePanelStyle
@@ -933,7 +969,7 @@ func (m Model) viewAddServerScreen() string {
 		)
 	}
 
-	hint := mutedStyle.Render("  [↑↓/tab] field  [←→/space] cycle type  [enter] advance/save  [esc] cancel")
+	hint := mutedStyle.Render("  [↑↓/tab] field  [shift+←→] cycle type  [enter] advance/save  [esc] cancel")
 	if !f.valid() {
 		hint += "  " + redStyle.Render("· required fields missing")
 	}

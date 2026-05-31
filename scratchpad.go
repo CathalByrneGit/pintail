@@ -4,11 +4,9 @@ import (
 	"context"
 	"encoding/csv"
 	"fmt"
-	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
@@ -257,11 +255,11 @@ func (sp Scratchpad) runQuery() (Scratchpad, tea.Cmd) {
 		return sp, client.QueryAsync(sql, srv)
 	}
 
-	// No client at all — pure mock, still async for consistent UX
+	// No client at all — return an offline result rather than fabricating.
 	return sp, func() tea.Msg {
 		r := mockExecute(sql, srv)
-		r.Method = "mock"
-		return queryResultMsg{result: &r, isMock: true}
+		r.Method = "offline"
+		return queryResultMsg{result: &r, isMock: false}
 	}
 }
 
@@ -509,255 +507,21 @@ func renderResultTable(r QueryResult, maxWidth int) string {
 	return sb.String()
 }
 
-// ── mock executor ─────────────────────────────────────────────────────────
+// ── offline stub (no mock data) ─────────────────────────────────────────
+//
+// Earlier versions of Pintail had a fabricated mock executor that returned
+// fake demo rows for queries like "SELECT * FROM analytics.orders" when no
+// real connection was available. That was confusing — the dashboard looked
+// populated, the scratchpad returned results, but none of it was real.
+// The honest behaviour is to surface the offline state and direct the user
+// at the README "Getting started" section.
 
 func mockExecute(query string, srv ServerInfo) QueryResult {
-	r := QueryResult{
+	return QueryResult{
 		Query:     query,
 		Timestamp: time.Now(),
-		ElapsedMs: rand.Intn(80) + 4,
+		Err:       "no online connection — start a Quack server, point at a .duckdb file, or attach a DuckLake (see README \"Getting started\")",
 	}
-
-	q := strings.ToLower(strings.TrimSpace(query))
-	q = strings.TrimRight(q, ";")
-
-	switch {
-	case strings.HasPrefix(q, "show tables"):
-		r.Columns = []string{"schema", "name", "format", "rows"}
-		for _, schema := range mockCatalog {
-			for _, tbl := range schema.Tables {
-				r.Rows = append(r.Rows, []string{
-					schema.Name, tbl.Name, tbl.Format, fmtRows(tbl.Rows),
-				})
-			}
-		}
-
-	case strings.HasPrefix(q, "describe "):
-		tableName := strings.TrimPrefix(q, "describe ")
-		tableName = strings.TrimPrefix(tableName, "analytics.")
-		tableName = strings.TrimPrefix(tableName, "raw.")
-		r.Columns = []string{"column_name", "column_type", "null", "key", "default"}
-		r.Rows = schemaForTable(tableName)
-		if len(r.Rows) == 0 {
-			r.Err = fmt.Sprintf("table not found: %s", tableName)
-		}
-
-	case strings.Contains(q, "count(*)") || strings.Contains(q, "count( * )"):
-		r.Columns = []string{"count(*)"}
-		n := rand.Intn(9_000_000) + 100_000
-		r.Rows = [][]string{{fmtInt(int64(n))}}
-		r.ElapsedMs += rand.Intn(200) // aggregations cost more
-
-	case strings.Contains(q, "orders"):
-		limit := extractLimit(q, 10)
-		r.Columns = []string{"order_id", "customer_id", "amount", "status", "order_date"}
-		r.Rows = mockOrderRows(limit)
-
-	case strings.Contains(q, "customers"):
-		limit := extractLimit(q, 10)
-		r.Columns = []string{"customer_id", "name", "email", "country", "created_at"}
-		r.Rows = mockCustomerRows(limit)
-
-	case strings.Contains(q, "events"):
-		limit := extractLimit(q, 10)
-		r.Columns = []string{"event_id", "session_id", "event_type", "page", "ts"}
-		r.Rows = mockEventRows(limit)
-
-	case strings.Contains(q, "logs"):
-		limit := extractLimit(q, 10)
-		r.Columns = []string{"ts", "level", "service", "message"}
-		r.Rows = mockLogRows(limit)
-		r.ElapsedMs += rand.Intn(30) // logs table is huge
-
-	case strings.Contains(q, "metrics"):
-		limit := extractLimit(q, 10)
-		r.Columns = []string{"ts", "metric", "value", "host", "env"}
-		r.Rows = mockMetricRows(limit)
-
-	case q == "select 1" || q == "select 1 as test":
-		r.Columns = []string{"1"}
-		r.Rows = [][]string{{"1"}}
-		r.ElapsedMs = 1
-
-	case strings.Contains(q, "quack_query"):
-		r.Err = "quack_query() is available via a live Quack server — connect a real server to execute"
-
-	default:
-		// Generic: pretend we ran something
-		if strings.HasPrefix(q, "select") {
-			r.Columns = []string{"result"}
-			r.Rows = [][]string{{"(mock executor — no table matched query pattern)"}}
-		} else if strings.HasPrefix(q, "insert") || strings.HasPrefix(q, "update") || strings.HasPrefix(q, "delete") {
-			r.Columns = []string{"rows_affected"}
-			n := rand.Intn(500) + 1
-			r.Rows = [][]string{{strconv.Itoa(n)}}
-		} else {
-			r.Err = "unrecognized statement (mock executor supports SELECT, SHOW TABLES, DESCRIBE)"
-		}
-	}
-
-	return r
-}
-
-// ── mock row generators ───────────────────────────────────────────────────
-
-var orderStatuses = []string{"shipped", "pending", "processing", "delivered", "cancelled"}
-var countries = []string{"US", "UK", "DE", "FR", "CA", "AU", "JP", "BR"}
-var eventTypes = []string{"page_view", "click", "form_submit", "purchase", "scroll", "search"}
-var logLevels = []string{"INFO", "INFO", "INFO", "WARN", "ERROR", "DEBUG"}
-var services = []string{"api-server", "auth-service", "data-ingest", "query-engine", "catalog-svc"}
-
-func mockOrderRows(n int) [][]string {
-	base := 10_000 + rand.Intn(5000)
-	rows := make([][]string, n)
-	for i := range rows {
-		rows[i] = []string{
-			fmt.Sprintf("%d", base+i),
-			fmt.Sprintf("c_%04d", rand.Intn(9999)),
-			fmt.Sprintf("%.2f", float64(rand.Intn(49900)+100)/100),
-			orderStatuses[rand.Intn(len(orderStatuses))],
-			randDate(90),
-		}
-	}
-	return rows
-}
-
-func mockCustomerRows(n int) [][]string {
-	firstNames := []string{"Alice", "Bob", "Carol", "Dan", "Eve", "Frank", "Grace", "Hiro"}
-	lastNames := []string{"Johnson", "Smith", "Patel", "Wang", "Müller", "Tanaka", "Okafor"}
-	rows := make([][]string, n)
-	for i := range rows {
-		fn := firstNames[rand.Intn(len(firstNames))]
-		ln := lastNames[rand.Intn(len(lastNames))]
-		email := strings.ToLower(fn) + "@example.com"
-		rows[i] = []string{
-			fmt.Sprintf("c_%04d", rand.Intn(9999)),
-			fn + " " + ln,
-			email,
-			countries[rand.Intn(len(countries))],
-			randDate(730),
-		}
-	}
-	return rows
-}
-
-func mockEventRows(n int) [][]string {
-	pages := []string{"/home", "/products", "/cart", "/checkout", "/account", "/search"}
-	rows := make([][]string, n)
-	for i := range rows {
-		rows[i] = []string{
-			fmt.Sprintf("e_%06d", rand.Intn(999999)),
-			fmt.Sprintf("s_%s", randHex(6)),
-			eventTypes[rand.Intn(len(eventTypes))],
-			pages[rand.Intn(len(pages))],
-			randTimestamp(7),
-		}
-	}
-	return rows
-}
-
-func mockLogRows(n int) [][]string {
-	msgs := []string{
-		"Request processed in %dms",
-		"Cache miss for key %s",
-		"Query plan selected: %s",
-		"Connection pool exhausted",
-		"Retrying after transient error",
-		"Health check passed",
-	}
-	rows := make([][]string, n)
-	for i := range rows {
-		tmpl := msgs[rand.Intn(len(msgs))]
-		var msg string
-		switch {
-		case strings.Contains(tmpl, "%d"):
-			msg = fmt.Sprintf(tmpl, rand.Intn(500)+1)
-		case strings.Contains(tmpl, "%s"):
-			msg = fmt.Sprintf(tmpl, randHex(4))
-		default:
-			msg = tmpl
-		}
-		rows[i] = []string{
-			randTimestamp(1),
-			logLevels[rand.Intn(len(logLevels))],
-			services[rand.Intn(len(services))],
-			msg,
-		}
-	}
-	return rows
-}
-
-func mockMetricRows(n int) [][]string {
-	metrics := []string{"cpu_usage", "mem_bytes", "req_latency_ms", "error_rate", "qps"}
-	envs := []string{"prod", "staging"}
-	rows := make([][]string, n)
-	for i := range rows {
-		rows[i] = []string{
-			randTimestamp(1),
-			metrics[rand.Intn(len(metrics))],
-			fmt.Sprintf("%.4f", rand.Float64()*100),
-			fmt.Sprintf("node-%02d", rand.Intn(12)+1),
-			envs[rand.Intn(len(envs))],
-		}
-	}
-	return rows
-}
-
-func schemaForTable(name string) [][]string {
-	schemas := map[string][][]string{
-		"orders": {
-			{"order_id", "INTEGER", "NO", "PRI", ""},
-			{"customer_id", "VARCHAR", "NO", "FK", ""},
-			{"amount", "DECIMAL(10,2)", "NO", "", ""},
-			{"status", "VARCHAR", "YES", "", "pending"},
-			{"order_date", "DATE", "NO", "", ""},
-		},
-		"customers": {
-			{"customer_id", "VARCHAR", "NO", "PRI", ""},
-			{"name", "VARCHAR", "NO", "", ""},
-			{"email", "VARCHAR", "YES", "", ""},
-			{"country", "VARCHAR", "YES", "", ""},
-			{"created_at", "TIMESTAMP", "NO", "", "now()"},
-		},
-		"events": {
-			{"event_id", "VARCHAR", "NO", "PRI", ""},
-			{"session_id", "VARCHAR", "NO", "", ""},
-			{"event_type", "VARCHAR", "NO", "", ""},
-			{"page", "VARCHAR", "YES", "", ""},
-			{"ts", "TIMESTAMP", "NO", "", ""},
-		},
-		"logs": {
-			{"ts", "TIMESTAMP", "NO", "", ""},
-			{"level", "VARCHAR", "NO", "", "INFO"},
-			{"service", "VARCHAR", "NO", "", ""},
-			{"message", "TEXT", "YES", "", ""},
-		},
-		"metrics": {
-			{"ts", "TIMESTAMP", "NO", "", ""},
-			{"metric", "VARCHAR", "NO", "", ""},
-			{"value", "DOUBLE", "NO", "", ""},
-			{"host", "VARCHAR", "NO", "", ""},
-			{"env", "VARCHAR", "NO", "", "prod"},
-		},
-	}
-	return schemas[name]
-}
-
-// ── util ──────────────────────────────────────────────────────────────────
-
-func extractLimit(q string, def int) int {
-	idx := strings.Index(q, "limit ")
-	if idx < 0 {
-		return def
-	}
-	var n int
-	if _, err := fmt.Sscanf(strings.TrimSpace(q[idx+6:]), "%d", &n); err == nil && n > 0 {
-		if n > 500 {
-			n = 500
-		}
-		return n
-	}
-	return def
 }
 
 func padRight(s string, w int) string {
@@ -791,37 +555,6 @@ func sum(ns []int) int {
 		t += n
 	}
 	return t
-}
-
-func fmtInt(n int64) string {
-	s := strconv.FormatInt(n, 10)
-	var out []byte
-	for i, c := range s {
-		if i > 0 && (len(s)-i)%3 == 0 {
-			out = append(out, ',')
-		}
-		out = append(out, byte(c))
-	}
-	return string(out)
-}
-
-func randDate(daysBack int) string {
-	d := time.Now().AddDate(0, 0, -rand.Intn(daysBack))
-	return d.Format("2006-01-02")
-}
-
-func randTimestamp(daysBack int) string {
-	d := time.Now().Add(-time.Duration(rand.Intn(daysBack*86400)) * time.Second)
-	return d.Format("2006-01-02 15:04:05")
-}
-
-func randHex(n int) string {
-	const chars = "0123456789abcdef"
-	out := make([]byte, n)
-	for i := range out {
-		out[i] = chars[rand.Intn(len(chars))]
-	}
-	return string(out)
 }
 
 // IsEmpty reports whether the result has no data rows worth exporting.

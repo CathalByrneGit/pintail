@@ -632,52 +632,8 @@ func splitTrim(s string) []string {
 // ── mock data ─────────────────────────────────────────────────────────────
 
 func mockTokens() []Token {
-	now := time.Now()
-	exp := now.Add(90 * 24 * time.Hour)
-	return []Token{
-		{
-			ID:          "a1b2c3d4",
-			Name:        "etl_bot_prod",
-			Value:       "qk_9f3a8b2c1d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a",
-			Scope:       []string{"raw", "analytics"},
-			Permissions: []string{"SELECT", "INSERT", "CREATE"},
-			CreatedAt:   now.Add(-45 * 24 * time.Hour),
-			ExpiresAt:   nil,
-			LastUsed:    now.Add(-4 * time.Minute),
-			Active:      true,
-		},
-		{
-			ID:          "b2c3d4e5",
-			Name:        "analyst_readonly",
-			Value:       "qk_1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b",
-			Scope:       []string{"analytics"},
-			Permissions: []string{"SELECT"},
-			CreatedAt:   now.Add(-12 * 24 * time.Hour),
-			ExpiresAt:   &exp,
-			LastUsed:    now.Add(-2 * time.Hour),
-			Active:      true,
-		},
-		{
-			ID:          "c3d4e5f6",
-			Name:        "dashboard_svc",
-			Value:       "qk_2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c",
-			Scope:       []string{"analytics"},
-			Permissions: []string{"SELECT"},
-			CreatedAt:   now.Add(-60 * 24 * time.Hour),
-			ExpiresAt:   nil,
-			LastUsed:    now.Add(-11 * time.Minute),
-			Active:      true,
-		},
-		{
-			ID:          "d4e5f6a7",
-			Name:        "old_migration_bot",
-			Value:       "qk_3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d",
-			Scope:       []string{"*"},
-			Permissions: []string{"*"},
-			CreatedAt:   now.Add(-180 * 24 * time.Hour),
-			ExpiresAt:   nil,
-			LastUsed:    now.Add(-30 * 24 * time.Hour),
-			Active:      false,
-		},
-	}
+	// Returns nothing by default — users create real tokens via the
+	// token manager (press [n] in the tokens screen). See the README
+	// "Getting started" section for how to bootstrap a working setup.
+	return nil
 }

@@ -584,11 +584,12 @@ func (c *QuackClient) QueryAsync(sql string, fallbackSrv ServerInfo) tea.Cmd {
 			}
 		}
 
-		// Offline — fall back to mock
+		// Offline — surface a clear error rather than fabricating data.
+		// mockExecute is now a stub that returns an "offline / see README" Err.
 		r := mockExecute(sql, fallbackSrv)
 		r.ElapsedMs = int(time.Since(start).Milliseconds())
-		r.Method = "mock"
-		return queryResultMsg{result: &r, isMock: true}
+		r.Method = "offline"
+		return queryResultMsg{result: &r, isMock: false}
 	}
 }
 

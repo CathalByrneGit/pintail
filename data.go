@@ -53,43 +53,23 @@ func tickCmd() tea.Cmd {
 	})
 }
 
-// ── mock data ─────────────────────────────────────────────────────────────
+// ── mock / seed data ──────────────────────────────────────────────────────
+//
+// Earlier versions of Pintail shipped with fabricated "demo" connections and
+// a fake catalog tree so the dashboard would look populated even when offline.
+// That turned out to be confusing — it looks real, but none of it is. The
+// honest default is empty state until a real server is reachable. See the
+// "Getting started" section in the README for how to spin up a local
+// Quack server, a local .duckdb file, or a test DuckLake to actually drive
+// the dashboard.
 
-var mockConnections = []Connection{
-	{ID: "c01", IP: "10.0.1.5", Identity: "analyst1", Catalog: "analytics", Duration: 14 * time.Minute, Queries: 23, Status: "active"},
-	{ID: "c02", IP: "10.0.1.7", Identity: "etl_bot", Catalog: "raw", Duration: 2*time.Hour + 3*time.Minute, Queries: 1847, Status: "active"},
-	{ID: "c03", IP: "10.0.2.3", Identity: "ml_svc", Catalog: "analytics", Duration: 47 * time.Minute, Queries: 312, Status: "idle"},
-	{ID: "c04", IP: "10.0.2.8", Identity: "dashboard", Catalog: "analytics", Duration: 8 * time.Minute, Queries: 5, Status: "active"},
-	{ID: "c05", IP: "192.168.1.9", Identity: "unknown_client", Catalog: "—", Duration: 2 * time.Minute, Queries: 0, Status: "error"},
-}
+var mockConnections []Connection = nil
 
-var mockCatalog = []CatalogSchema{
-	{Name: "analytics", Open: true, Tables: []CatalogTable{
-		{Name: "orders", Format: "parquet", Rows: 4_823_901},
-		{Name: "customers", Format: "parquet", Rows: 281_450},
-		{Name: "events", Format: "parquet", Rows: 92_047_332},
-	}},
-	{Name: "raw", Open: true, Tables: []CatalogTable{
-		{Name: "logs", Format: "parquet", Rows: 412_983_010},
-		{Name: "metrics", Format: "delta", Rows: 88_291_004},
-		{Name: "traces", Format: "parquet", Rows: 12_003_441},
-	}},
-	{Name: "staging", Open: false, Tables: []CatalogTable{
-		{Name: "orders_staging", Format: "parquet", Rows: 10_231},
-		{Name: "events_staging", Format: "parquet", Rows: 882_331},
-	}},
-}
+var mockCatalog []CatalogSchema = nil
 
-// refreshConnections simulates live metric changes on each tick.
+// refreshConnections used to fake live metric changes per tick. It now just
+// returns its input unchanged — the dashboard reflects whatever the live
+// session fetch returned, and nothing else.
 func refreshConnections(conns []Connection) []Connection {
-	increments := []int{3, 127, 0, 1, 0}
-	updated := make([]Connection, len(conns))
-	copy(updated, conns)
-	for i := range updated {
-		updated[i].Duration += 2 * time.Second
-		if updated[i].Status == "active" && i < len(increments) {
-			updated[i].Queries += increments[i]
-		}
-	}
-	return updated
+	return conns
 }
