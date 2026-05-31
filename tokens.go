@@ -278,8 +278,34 @@ func (tm TokenManager) updateRevokeConfirm(msg tea.KeyMsg) (TokenManager, tea.Cm
 // ── View helpers ──────────────────────────────────────────────────────────
 
 func (tm TokenManager) ViewTokenList(width, height int) string {
+	// Tab nav header — same pattern as ViewSecretList so both modes look
+	// consistent and the user can see they're toggleable.
+	header := lipgloss.JoinHorizontal(lipgloss.Top,
+		lipgloss.NewStyle().
+			Background(colorDuckYellow).Foreground(colorDarkBg).Bold(true).
+			Padding(0, 1).Render("Quack tokens"),
+		mutedStyle.Render("   Storage secrets  "),
+	)
+
 	var lines []string
-	lines = append(lines, labelStyle.Render("TOKENS"), "")
+	lines = append(lines, header, "")
+	lines = append(lines, labelStyle.Render("  TOKENS  ")+
+		mutedStyle.Render(fmt.Sprintf("(%d total)", len(tm.tokens))))
+	lines = append(lines, "")
+
+	if len(tm.tokens) == 0 {
+		lines = append(lines,
+			mutedStyle.Render("  ◌ no tokens yet"),
+			"",
+			mutedStyle.Render("  press [n] to create one"),
+			"",
+			mutedStyle.Render("  tokens are bearer credentials a Quack server"),
+			mutedStyle.Render("  accepts on inbound connections — once created"),
+			mutedStyle.Render("  here, export to SQL with [e] and run on the"),
+			mutedStyle.Render("  server."),
+		)
+		return strings.Join(lines, "\n")
+	}
 
 	for i, t := range tm.tokens {
 		cursor := "  "

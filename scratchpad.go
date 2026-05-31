@@ -213,11 +213,41 @@ func (sp Scratchpad) Update(msg tea.Msg) (Scratchpad, tea.Cmd) {
 			return sp, nil
 
 		case "pgup", "ctrl+b":
-			sp.resultsVP, _ = sp.resultsVP.Update(msg)
+			// Call viewport's page-up method directly. The bubbles viewport
+			// default keymap doesn't bind ctrl+b/ctrl+f, so forwarding the
+			// raw msg to viewport.Update was silently doing nothing for them.
+			sp.resultsVP.ViewUp()
 			return sp, nil
 
 		case "pgdown", "ctrl+f":
-			sp.resultsVP, _ = sp.resultsVP.Update(msg)
+			sp.resultsVP.ViewDown()
+			return sp, nil
+
+		case "ctrl+u":
+			// half-page up (vim/less convention)
+			sp.resultsVP.HalfViewUp()
+			return sp, nil
+
+		case "ctrl+d":
+			// half-page down
+			sp.resultsVP.HalfViewDown()
+			return sp, nil
+
+		case "alt+up":
+			// single-line scroll up — works on every keyboard, no Fn dance
+			sp.resultsVP.LineUp(1)
+			return sp, nil
+
+		case "alt+down":
+			sp.resultsVP.LineDown(1)
+			return sp, nil
+
+		case "home":
+			sp.resultsVP.GotoTop()
+			return sp, nil
+
+		case "end":
+			sp.resultsVP.GotoBottom()
 			return sp, nil
 
 		default:
@@ -379,11 +409,20 @@ func (sp Scratchpad) ViewResultsStatus() string {
 	elapsed := fmt.Sprintf("%dms", sp.result.ElapsedMs)
 	ts := sp.result.Timestamp.Format("15:04:05")
 
+	// Scroll position indicator — shows up only when the result is taller
+	// than the viewport (otherwise it's noise).
+	var scrollIndicator string
+	if sp.resultsVP.TotalLineCount() > sp.resultsVP.Height {
+		pct := int(sp.resultsVP.ScrollPercent() * 100)
+		scrollIndicator = mutedStyle.Render(fmt.Sprintf("  ·  scroll %d%%", pct))
+	}
+
 	return "  " + badge +
 		mutedStyle.Render("  ·  ") +
 		greenStyle.Render(fmt.Sprintf("%d %s", len(sp.result.Rows), rowWord)) +
 		mutedStyle.Render("  ·  "+elapsed+"  ·  "+ts+"  ·  ") +
 		mutedStyle.Render(truncate(firstLine(sp.result.Query), 40)) +
+		scrollIndicator +
 		cliHint
 }
 
@@ -425,7 +464,7 @@ func (sp Scratchpad) ViewFooter() string {
 		keyBadge("ctrl+r") + " run",
 		keyBadge("ctrl+p/n") + " history",
 		keyBadge("ctrl+e") + " export",
-		keyBadge("pgup/dn") + " scroll",
+		keyBadge("ctrl+b/f") + " page  " + keyBadge("ctrl+u/d") + " ½page  " + keyBadge("alt+↑↓") + " line",
 		keyBadge("ctrl+l") + " clear",
 		keyBadge("tab") + " target",
 		keyBadge("esc") + " back",

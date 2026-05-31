@@ -15,6 +15,7 @@
 ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
 ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠙⠇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
 ```
+
 # Pintail
 
 > **A terminal admin console for [Quack](https://duckdb.org) and
@@ -53,7 +54,6 @@ binary; shells out to the `duckdb` CLI for live operations.
 |-------------------------------------------------------|-----------------------|
 | Explore data, write multi-statement queries, autocomplete, themes, plugins | **[Harlequin](https://harlequin.sh)** — Python+Textual SQL IDE |
 | Build SQL notebooks against local DuckDB             | **[DuckDB Local UI](https://duckdb.org/2025/03/12/duckdb-ui)** — browser-based, official |
-| Browse a DuckDB file in the browser                  | **[Duck UI](https://github.com/iberodatabr/duck-ui)** — WASM-based |
 | Operate a Quack/DuckLake server: tokens, TLS, snapshots, multi-server ping, auth policies | **Pintail** (this) |
 
 The scratchpad here is intentionally minimal — a place to run quick
@@ -124,25 +124,54 @@ Then add a DuckLake connection in Pintail:
 The snapshots screen (`l`) now lists real snapshots; the catalog panel
 populates from `information_schema.tables`; queries actually return rows.
 
-### 3. Quack server — read the docs
+### 3. A real Quack server (using DuckDB's built-in `quack` extension)
 
-A "real" Quack server (the multi-writer DuckDB-as-a-service deployment
-that Pintail was originally built for) is a more involved setup — it
-typically means running a process exposing the Quack protocol on a
-host:port that other DuckDB clients can attach to. The setup steps for
-that depend on which Quack server implementation you're using (the
-official DuckDB Quack extension, [quacklake](https://github.com/tobilg/quacklake)
-on Cloudflare Workers, or one you've built). Once you have one running:
+DuckDB ships a `quack` extension that turns any DuckDB session into a Quack
+server. Available in DuckDB ≥1.5.3.
 
-- Press `a`, keep type as **Quack**
-- Host: `your-server` , Port: `9494` (or whatever)
-- Token: paste the bearer credential the server expects
-- TLS: `y` if it's behind HTTPS termination
+In one terminal, start a server backed by a real database:
 
-Then for production deployments, the **TLS config** (`x`) and **Auth
-policy** (`p`) screens become useful: the former generates Caddy/Nginx/
-Envoy reverse-proxy configs with the required `h2c` upgrade, the latter
-manages per-token grants via `ALTER SECRET`.
+```bash
+duckdb /tmp/quack-server.duckdb -c "
+INSTALL quack;
+LOAD quack;
+CREATE TABLE events AS
+  SELECT range::INTEGER AS id,
+         (random() * 1000)::INTEGER AS user_id,
+         now() - INTERVAL (random() * 30) DAY AS ts
+  FROM range(10000);
+CALL quack_serve('quack:localhost');
+"
+```
+
+`quack_serve` prints the listen URI and an `auth_token` — copy the token.
+The duckdb process then blocks, holding the server open. Leave that
+terminal alone; control-C stops it.
+
+In another terminal, launch Pintail and add a Quack connection:
+
+- `a` to open the connection manager
+- `shift+→` until type is **Quack** (it's the default)
+- Host: `localhost`,  Port: `9494`,  Token: *(paste the auth_token)*,  TLS: `n`
+- `enter` to save
+
+The connection chip flips from `× offline` to `● online`, the sessions
+panel populates from `duckdb_connections()` on the server, and the
+catalog tree shows the real tables. The scratchpad now runs queries via
+HTTP to the Quack server.
+
+**For external access**, bind to a non-local interface and front with a
+TLS-terminating reverse proxy:
+
+```sql
+CALL quack_serve('quack:0.0.0.0:9494', allow_other_hostname => true);
+```
+
+Pintail's **TLS config** screen (`x`) generates ready-to-deploy Caddy /
+Nginx / Envoy configs with the `h2c` upgrade Quack needs. The **Auth
+policy** screen (`p`) manages per-token grants via `ALTER SECRET`. For
+the full security model see the
+[Quack security docs](https://duckdb.org/docs/current/quack/security).
 
 ### Bootstrapping the config file directly
 

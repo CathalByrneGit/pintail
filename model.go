@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -86,6 +88,70 @@ type formField struct {
 	value       *string
 	placeholder string
 	hint        string
+}
+
+// ── path-completion helpers ───────────────────────────────────────────────
+//
+// These power the tab-to-complete behaviour on path-style fields in the
+// add-connection form. Shell-style: tab completes to the longest common
+// prefix among matching files; once the value matches an existing path
+// (no further completion possible), tab falls through to the normal
+// "advance to next field" behaviour.
+
+// isPathField reports whether a form-field label represents a filesystem
+// path that should support tab completion. Kept as a small allowlist
+// rather than a struct flag to avoid threading new state through the
+// visibleFields() return type.
+func isPathField(label string) bool {
+	switch label {
+	case "Path", "Catalog path", "Storage":
+		return true
+	}
+	return false
+}
+
+// completePath expands ~ and returns either the same partial path (no
+// matches), the unique match (single match), or the longest common prefix
+// of all matches. The returned value is what should replace the field's
+// current contents.
+func completePath(partial string) string {
+	expanded := partial
+	if strings.HasPrefix(expanded, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			expanded = filepath.Join(home, expanded[2:])
+		}
+	}
+	matches, err := filepath.Glob(expanded + "*")
+	if err != nil || len(matches) == 0 {
+		return partial
+	}
+	if len(matches) == 1 {
+		// Append a trailing slash for directories to make the next tab
+		// drill in. Shell convention.
+		if info, err := os.Stat(matches[0]); err == nil && info.IsDir() {
+			return matches[0] + string(filepath.Separator)
+		}
+		return matches[0]
+	}
+	// Longest common prefix among multiple matches.
+	lcp := matches[0]
+	for _, m := range matches[1:] {
+		lcp = longestCommonPrefix(lcp, m)
+	}
+	return lcp
+}
+
+func longestCommonPrefix(a, b string) string {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	for i := 0; i < n; i++ {
+		if a[i] != b[i] {
+			return a[:i]
+		}
+	}
+	return a[:n]
 }
 
 func newAddServerForm() *addServerForm {
@@ -603,13 +669,36 @@ func (m Model) updateAddServer(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// ── form-focus mode (type selector + fields) ──────────────────────────
 	switch msg.String() {
 	case "esc":
-		m.addForm = nil
-		m.currentView = viewDashboard
+		// Return to the list view rather than exiting the whole screen.
+		// Cancels any in-progress edit / new connection but preserves
+		// which row in the list the user had highlighted.
+		prevCursor := f.listCursor
+		fresh := newAddServerForm()
+		fresh.focusIdx = -2
+		fresh.listCursor = prevCursor
+		m.addForm = fresh
 		return m, nil
 
 	case "tab", "down":
+		visible := f.visibleFields()
+		// Path-completion: on a path-like field, tab first tries to complete
+		// the partial path via glob. Only advances to the next field when the
+		// value has no further completion available.
+		if f.focusIdx >= 0 && f.focusIdx < len(visible) {
+			fld := visible[f.focusIdx]
+			if isPathField(fld.label) && *fld.value != "" {
+				completed := completePath(*fld.value)
+				if completed != *fld.value {
+					*fld.value = completed
+					return m, nil
+				}
+			}
+		}
+		// Advance — wrap from the last field back to the list panel.
 		if f.focusIdx < len(visible)-1 {
 			f.focusIdx++
+		} else {
+			f.focusIdx = -2
 		}
 		return m, nil
 
@@ -969,7 +1058,19 @@ func (m Model) viewAddServerScreen() string {
 		)
 	}
 
-	hint := mutedStyle.Render("  [↑↓/tab] field  [shift+←→] cycle type  [enter] advance/save  [esc] cancel")
+	// Context-aware hint: on path-like fields, mention tab-completion.
+	var hint string
+	onPathField := false
+	if f.focusIdx >= 0 && f.focusIdx < len(visible) {
+		if isPathField(visible[f.focusIdx].label) {
+			onPathField = true
+		}
+	}
+	if onPathField {
+		hint = mutedStyle.Render("  [tab] complete path  [↓] next field  [shift+←→] cycle type  [enter] save  [esc] back")
+	} else {
+		hint = mutedStyle.Render("  [↑↓/tab] field  [shift+←→] cycle type  [enter] advance/save  [esc] back")
+	}
 	if !f.valid() {
 		hint += "  " + redStyle.Render("· required fields missing")
 	}
