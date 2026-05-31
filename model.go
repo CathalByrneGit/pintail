@@ -1,0 +1,1290 @@
+package main
+
+import (
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/charmbracelet/bubbles/table"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+)
+
+// ── view enum ─────────────────────────────────────────────────────────────
+
+type appView int
+
+const (
+	viewDashboard appView = iota
+	viewTokens
+	viewScratchpad
+	viewAddServer
+	viewTLS
+	viewAuth
+	viewSnapshots
+)
+
+type panel int
+
+const (
+	panelConnections panel = iota
+	panelCatalog
+)
+
+// ── tickers ───────────────────────────────────────────────────────────────
+//
+// Three independent cadences keep subprocess spawning under control:
+//   • pingTick    (5s)  — cheap TCP reachability check, no subprocess
+//   • sessionTick (15s) — refresh live sessions for ONLINE servers only
+//   • catalog is fetched once on each offline→online transition, not on a timer
+
+type pingTickMsg time.Time
+type sessionTickMsg time.Time
+
+func pingTickCmd() tea.Cmd {
+	return tea.Tick(5*time.Second, func(t time.Time) tea.Msg {
+		return pingTickMsg(t)
+	})
+}
+
+func sessionTickCmd() tea.Cmd {
+	return tea.Tick(15*time.Second, func(t time.Time) tea.Msg {
+		return sessionTickMsg(t)
+	})
+}
+
+// ── add-server form ───────────────────────────────────────────────────────
+//
+// The form has a Type selector at the top (cycled with space / ←→) which
+// decides which input fields appear below. All possible field values are
+// kept on the struct so cycling Type doesn't lose what the user already typed.
+
+type addServerForm struct {
+	connType ConnType
+	focusIdx int // -1 = type selector focused; -2 = connection list focused; ≥0 = field index
+	// editingIdx >= 0 means we're editing m.configs[editingIdx] instead of adding
+	editingIdx int
+
+	// All possible values; only some matter per connType.
+	name        string
+	host        string
+	port        string
+	token       string
+	tls         string // "y"/"n"
+	path        string
+	catalogPath string
+	catalogRef  string
+	storagePath string
+	secretRef   string // storage_secret_ref — applies to local + ducklake
+
+	// Index of currently-selected row in the connection list, for edit/delete.
+	listCursor int
+}
+
+type formField struct {
+	label       string
+	value       *string
+	placeholder string
+	hint        string
+}
+
+func newAddServerForm() *addServerForm {
+	return &addServerForm{
+		connType:   ConnQuack,
+		focusIdx:   -1,
+		editingIdx: -1,
+		port:       "9494",
+		tls:        "n",
+	}
+}
+
+// formFromConfig builds a form pre-populated for editing an existing config.
+func formFromConfig(cfg ServerConfig, idx int) *addServerForm {
+	f := &addServerForm{
+		connType:    cfg.Type,
+		focusIdx:    0,
+		editingIdx:  idx,
+		name:        cfg.Name,
+		host:        cfg.Host,
+		port:        fmt.Sprintf("%d", cfg.Port),
+		token:       cfg.Token,
+		path:        cfg.Path,
+		catalogPath: cfg.CatalogPath,
+		catalogRef:  cfg.CatalogRef,
+		storagePath: cfg.StoragePath,
+		secretRef:   cfg.StorageSecretRef,
+	}
+	if cfg.Port == 0 {
+		f.port = "9494"
+	}
+	if cfg.TLS {
+		f.tls = "y"
+	} else {
+		f.tls = "n"
+	}
+	if f.connType == "" {
+		f.connType = ConnQuack
+	}
+	return f
+}
+
+// visibleFields returns the editable fields for the currently-selected type.
+//
+// The per-type field sets stay as type-dispatch — they're different fields
+// with different meanings for each backend. The Storage secret field is the
+// one cross-cutting concern: any type with CapStorageSecrets gets it appended.
+func (f *addServerForm) visibleFields() []formField {
+	var base []formField
+	switch f.connType {
+	case ConnLocal:
+		base = []formField{
+			{"Name", &f.name, "e.g. local-dev", "logical name for this connection"},
+			{"Path", &f.path, "/path/to/database.duckdb", "absolute path; or remote URI like s3://bucket/db.duckdb"},
+		}
+	case ConnDuckLake:
+		base = []formField{
+			{"Name", &f.name, "e.g. lake-prod", "logical name for this connection"},
+			{"Catalog ref", &f.catalogRef, "name of another connection (preferred)", "use a configured connection as catalog — overrides Catalog path"},
+			{"Catalog path", &f.catalogPath, "postgres://… · sqlite:///… · ./catalog.duckdb", "freeform catalog URL or path (used when Catalog ref is empty)"},
+			{"Storage", &f.storagePath, "s3://bucket/lake or /mnt/lake", "object storage root (DATA_PATH)"},
+		}
+	default: // ConnQuack
+		base = []formField{
+			{"Name", &f.name, "e.g. prod-quack", "logical name for this connection"},
+			{"Host", &f.host, "localhost or IP", "Quack server hostname"},
+			{"Port", &f.port, "9494", "Quack server port"},
+			{"Token", &f.token, "shared master token", "leave blank if server has no auth"},
+			{"TLS", &f.tls, "n", "y for HTTPS, n for HTTP"},
+		}
+	}
+
+	// Cross-cutting field: any backend with CapStorageSecrets gets the ref field.
+	probe := ServerConfig{Type: f.connType}
+	if probe.Supports(CapStorageSecrets) {
+		hint := "name of a Storage secret — manage these on the token screen"
+		if f.connType == ConnLocal {
+			hint = "name of a Storage secret — needed when path is a remote URI"
+		}
+		base = append(base, formField{
+			"Storage secret", &f.secretRef,
+			"  (optional)", hint,
+		})
+	}
+	return base
+}
+
+// toConfig builds a ServerConfig from the current form state.
+func (f *addServerForm) toConfig() ServerConfig {
+	port := 9494
+	fmt.Sscanf(f.port, "%d", &port)
+	tls := strings.ToLower(strings.TrimSpace(f.tls)) == "y"
+	return ServerConfig{
+		Name:             strings.TrimSpace(f.name),
+		Type:             f.connType,
+		Host:             strings.TrimSpace(f.host),
+		Port:             port,
+		Token:            f.token,
+		TLS:              tls,
+		Path:             strings.TrimSpace(f.path),
+		CatalogPath:      strings.TrimSpace(f.catalogPath),
+		CatalogRef:       strings.TrimSpace(f.catalogRef),
+		StoragePath:      strings.TrimSpace(f.storagePath),
+		StorageSecretRef: strings.TrimSpace(f.secretRef),
+	}
+}
+
+// valid returns whether the form has the minimum required fields filled in.
+func (f *addServerForm) valid() bool {
+	if f.name == "" {
+		return false
+	}
+	switch f.connType {
+	case ConnLocal:
+		return f.path != ""
+	case ConnDuckLake:
+		return f.storagePath != "" && (f.catalogPath != "" || f.catalogRef != "")
+	default:
+		return f.host != ""
+	}
+}
+
+// ── Model ─────────────────────────────────────────────────────────────────
+
+type Model struct {
+	width  int
+	height int
+
+	currentView appView
+
+	// real server clients (config + live state)
+	clients        []*QuackClient
+	configs        []ServerConfig  // kept in sync with clients
+	storageSecrets []StorageSecret // referenced via Config.StorageSecretRef
+
+	// per-client previous online state, for transition detection
+	wasOnline []bool
+
+	// dashboard
+	focus       panel
+	connections []Connection
+	catalog     []CatalogSchema
+	connTable   table.Model
+	tick        int
+
+	// token manager
+	tokenMgr TokenManager
+
+	// scratchpad
+	scratchpad Scratchpad
+
+	// auth policy editor
+	authEditor AuthEditor
+
+	// ducklake snapshots
+	snapshots SnapshotsView
+
+	// tls config generator
+	tlsGen TLSGenerator
+
+	// add-server form
+	addForm *addServerForm
+}
+
+func NewModel() Model {
+	configs := LoadServerConfigs()
+	secrets := LoadStorageSecrets()
+	clients := InitClients(configs, secrets)
+
+	servers := make([]ServerInfo, len(configs))
+	for i, cfg := range configs {
+		servers[i] = cfg.ToServerInfo()
+	}
+
+	m := Model{
+		clients:        clients,
+		configs:        configs,
+		storageSecrets: secrets,
+		wasOnline:      make([]bool, len(clients)),
+		connections:    mockConnections,
+		catalog:        mockCatalog,
+		focus:          panelConnections,
+		currentView:    viewDashboard,
+		tokenMgr:       NewTokenManager(),
+		scratchpad:     NewScratchpad(servers, clients),
+		tlsGen:         NewTLSGenerator(configs),
+		authEditor:     NewAuthEditor(mockTokens(), clients),
+		snapshots:      NewSnapshotsView(clients),
+	}
+	m.connTable = buildConnectionTable(mockConnections)
+	return m
+}
+
+func buildConnectionTable(conns []Connection) table.Model {
+	cols := []table.Column{
+		{Title: "ID", Width: 4},
+		{Title: "IP Address", Width: 15},
+		{Title: "Identity", Width: 16},
+		{Title: "Catalog", Width: 12},
+		{Title: "Duration", Width: 8},
+		{Title: "Queries", Width: 8},
+		{Title: "Status", Width: 10},
+	}
+	t := table.New(
+		table.WithColumns(cols),
+		table.WithRows(connectionRows(conns)),
+		table.WithFocused(true),
+		table.WithHeight(8),
+	)
+	s := table.DefaultStyles()
+	s.Header = s.Header.
+		BorderStyle(lipgloss.NormalBorder()).
+		BorderForeground(colorPanelBorder).
+		BorderBottom(true).Bold(true).
+		Foreground(colorDuckYellow)
+	s.Selected = s.Selected.
+		Foreground(colorDarkBg).Background(colorDuckYellow).Bold(false)
+	t.SetStyles(s)
+	return t
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────
+
+func (m Model) Init() tea.Cmd {
+	// Start data ticker + ping ticker + session ticker + initial ping
+	cmds := []tea.Cmd{tickCmd(), pingTickCmd(), sessionTickCmd()}
+	for i, c := range m.clients {
+		cmds = append(cmds, pingServerCmd(c, i))
+	}
+	return tea.Batch(cmds...)
+}
+
+// ── Update ────────────────────────────────────────────────────────────────
+
+func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var cmd tea.Cmd
+
+	switch msg := msg.(type) {
+
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		tableH := m.height - 15
+		if tableH < 2 {
+			tableH = 2
+		}
+		m.connTable.SetHeight(tableH)
+		m.scratchpad.Resize(m.width, m.height)
+
+	// ── ping result: detect offline→online transition ─────────────────────
+	case pingResultMsg:
+		if msg.idx >= len(m.clients) {
+			return m, nil
+		}
+		nowOnline := msg.err == nil
+		justConnected := nowOnline && msg.idx < len(m.wasOnline) && !m.wasOnline[msg.idx]
+		if msg.idx < len(m.wasOnline) {
+			m.wasOnline[msg.idx] = nowOnline
+		}
+		// Only on a fresh connection do we pull catalog + sessions (catalog is
+		// relatively static, so this avoids re-fetching it on every ping).
+		if justConnected && m.clients[msg.idx].HasCLI() {
+			c := m.clients[msg.idx]
+			return m, tea.Batch(c.FetchSessionsCmd(), c.FetchCatalogCmd())
+		}
+		return m, nil
+
+	// ── ping ticker: cheap TCP check for every server ──────────────────────
+	case pingTickMsg:
+		cmds := []tea.Cmd{pingTickCmd()}
+		for i, c := range m.clients {
+			cmds = append(cmds, pingServerCmd(c, i))
+		}
+		return m, tea.Batch(cmds...)
+
+	// ── session ticker: refresh sessions for ONLINE servers only ───────────
+	case sessionTickMsg:
+		cmds := []tea.Cmd{sessionTickCmd()}
+		for _, c := range m.clients {
+			if c.GetState().Online && c.HasCLI() {
+				cmds = append(cmds, c.FetchSessionsCmd())
+			}
+		}
+		return m, tea.Batch(cmds...)
+
+	// ── live session results ───────────────────────────────────────────────
+	case sessionResultMsg:
+		if msg.err == nil && len(msg.connections) > 0 {
+			m.connections = msg.connections
+			m.connTable.SetRows(connectionRows(m.connections))
+		}
+		return m, nil
+
+	// ── live catalog results ───────────────────────────────────────────────
+	case catalogResultMsg:
+		if msg.err == nil && len(msg.catalog) > 0 {
+			m.catalog = msg.catalog
+		}
+		return m, nil
+
+	// ── data ticker ───────────────────────────────────────────────────────
+	case tickMsg:
+		m.tick++
+		m.connections = refreshConnections(m.connections)
+		m.connTable.SetRows(connectionRows(m.connections))
+		var tmCmd tea.Cmd
+		m.tokenMgr, tmCmd = m.tokenMgr.Update(msg)
+		var authCmd tea.Cmd
+		m.authEditor, authCmd = m.authEditor.Update(msg)
+		return m, tea.Batch(tickCmd(), tmCmd, authCmd)
+
+	// ── query result (scratchpad async) ───────────────────────────────────
+	case queryResultMsg:
+		var spCmd tea.Cmd
+		m.scratchpad, spCmd = m.scratchpad.Update(msg)
+		return m, spCmd
+
+	// ── snapshot results (ducklake) ───────────────────────────────────────
+	case snapshotsResultMsg:
+		var snapCmd tea.Cmd
+		m.snapshots, snapCmd = m.snapshots.Update(msg)
+		return m, snapCmd
+
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "ctrl+c":
+			return m, tea.Quit
+		}
+
+		switch m.currentView {
+
+		case viewDashboard:
+			switch msg.String() {
+			case "q":
+				return m, tea.Quit
+			case "t":
+				m.currentView = viewTokens
+				return m, nil
+			case "s":
+				m.currentView = viewScratchpad
+				m.scratchpad.Resize(m.width, m.height)
+				return m, nil
+			case "a":
+				m.addForm = newAddServerForm()
+				m.currentView = viewAddServer
+				return m, nil
+			case "p":
+				m.authEditor = NewAuthEditor(m.tokenMgr.tokens, m.clients)
+				m.currentView = viewAuth
+				return m, nil
+			case "l":
+				// Rebuild from current clients (configs may have changed)
+				m.snapshots = NewSnapshotsView(m.clients)
+				m.currentView = viewSnapshots
+				if m.snapshots.HasLake() {
+					m.snapshots.loading = true
+					return m, m.snapshots.FetchCmd()
+				}
+				return m, nil
+			case "x":
+				m.tlsGen.SetWidth(m.width)
+				m.currentView = viewTLS
+				return m, nil
+			case "tab", "shift+tab":
+				if m.focus == panelConnections {
+					m.focus = panelCatalog
+					m.connTable.Blur()
+				} else {
+					m.focus = panelConnections
+					m.connTable.Focus()
+				}
+				return m, nil
+			case "r":
+				// Refresh: re-poll live data for online servers; fall back to
+				// nudging the mock counters when nothing is connected.
+				var cmds []tea.Cmd
+				anyOnline := false
+				for _, c := range m.clients {
+					if c.GetState().Online && c.HasCLI() {
+						anyOnline = true
+						cmds = append(cmds, c.FetchSessionsCmd(), c.FetchCatalogCmd())
+					}
+				}
+				if !anyOnline {
+					m.connections = refreshConnections(m.connections)
+					m.connTable.SetRows(connectionRows(m.connections))
+					return m, nil
+				}
+				return m, tea.Batch(cmds...)
+			}
+
+		case viewTokens:
+			if msg.String() == "esc" &&
+				m.tokenMgr.form == nil && !m.tokenMgr.rotateConfirm && !m.tokenMgr.revokeConfirm &&
+				m.tokenMgr.secretForm == nil && !m.tokenMgr.secretDelConfirm {
+				// Sync any storage-secret edits back to the model and rebuild
+				// clients so their resolvers see the latest secret values.
+				if !storageSecretsEqual(m.storageSecrets, m.tokenMgr.secrets) {
+					m.storageSecrets = append([]StorageSecret(nil), m.tokenMgr.secrets...)
+					m.clients = InitClients(m.configs, m.storageSecrets)
+				}
+				m.currentView = viewDashboard
+				return m, nil
+			}
+			var tmCmd tea.Cmd
+			m.tokenMgr, tmCmd = m.tokenMgr.Update(msg)
+			return m, tmCmd
+
+		case viewScratchpad:
+			if msg.String() == "esc" {
+				m.currentView = viewDashboard
+				return m, nil
+			}
+			var spCmd tea.Cmd
+			m.scratchpad, spCmd = m.scratchpad.Update(msg)
+			return m, spCmd
+
+		case viewTLS:
+			if msg.String() == "esc" {
+				m.currentView = viewDashboard
+				return m, nil
+			}
+			var tlsCmd tea.Cmd
+			m.tlsGen, tlsCmd = m.tlsGen.Update(msg)
+			return m, tlsCmd
+
+		case viewAuth:
+			if msg.String() == "esc" {
+				m.currentView = viewDashboard
+				return m, nil
+			}
+			var authCmd tea.Cmd
+			m.authEditor, authCmd = m.authEditor.Update(msg)
+			return m, authCmd
+
+		case viewSnapshots:
+			if msg.String() == "esc" {
+				m.currentView = viewDashboard
+				return m, nil
+			}
+			var snapCmd tea.Cmd
+			m.snapshots, snapCmd = m.snapshots.Update(msg)
+			return m, snapCmd
+
+		case viewAddServer:
+			return m.updateAddServer(msg)
+		}
+	}
+
+	if m.currentView == viewDashboard && m.focus == panelConnections {
+		m.connTable, cmd = m.connTable.Update(msg)
+	}
+	return m, cmd
+}
+
+// updateAddServer handles key input on the connection manager form.
+//
+// Focus modes:
+//
+//	-2 = connection list (left panel)  — supports e (edit), d (delete), ↑↓
+//	-1 = type selector at top of form  — ←→ / space cycles
+//	 0..N-1 = visible form field index — typed input
+func (m Model) updateAddServer(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	f := m.addForm
+	visible := f.visibleFields()
+
+	// ── list-focus mode ───────────────────────────────────────────────────
+	if f.focusIdx == -2 {
+		switch msg.String() {
+		case "esc":
+			m.addForm = nil
+			m.currentView = viewDashboard
+			return m, nil
+		case "tab", "right":
+			f.focusIdx = -1
+			return m, nil
+		case "up", "k":
+			if f.listCursor > 0 {
+				f.listCursor--
+			}
+			return m, nil
+		case "down", "j":
+			if f.listCursor < len(m.configs)-1 {
+				f.listCursor++
+			}
+			return m, nil
+		case "e":
+			if f.listCursor < len(m.configs) {
+				m.addForm = formFromConfig(m.configs[f.listCursor], f.listCursor)
+			}
+			return m, nil
+		case "d":
+			if f.listCursor < len(m.configs) && len(m.configs) > 1 {
+				m.configs = append(m.configs[:f.listCursor], m.configs[f.listCursor+1:]...)
+				if f.listCursor < len(m.wasOnline) {
+					m.wasOnline = append(m.wasOnline[:f.listCursor], m.wasOnline[f.listCursor+1:]...)
+				}
+				m.clients = InitClients(m.configs, m.storageSecrets)
+				servers := make([]ServerInfo, len(m.configs))
+				for i, c := range m.configs {
+					servers[i] = c.ToServerInfo()
+				}
+				m.scratchpad.servers = servers
+				m.scratchpad.clients = m.clients
+				SaveServerConfigs(m.configs)
+				if f.listCursor >= len(m.configs) && f.listCursor > 0 {
+					f.listCursor--
+				}
+			}
+			return m, nil
+		}
+		return m, nil
+	}
+
+	// ── form-focus mode (type selector + fields) ──────────────────────────
+	switch msg.String() {
+	case "esc":
+		m.addForm = nil
+		m.currentView = viewDashboard
+		return m, nil
+
+	case "tab", "down":
+		if f.focusIdx < len(visible)-1 {
+			f.focusIdx++
+		}
+		return m, nil
+
+	case "shift+tab", "up":
+		if f.focusIdx > -1 {
+			f.focusIdx--
+		}
+		return m, nil
+
+	case "left":
+		if f.focusIdx == -1 {
+			// Cycle type backwards
+			for i := 0; i < len(AllConnTypes)-1; i++ {
+				f.connType = f.connType.Next()
+			}
+		} else if f.focusIdx == 0 {
+			// From first field, ←  jumps to the connection list
+			f.focusIdx = -2
+		}
+		return m, nil
+
+	case "right", " ":
+		if f.focusIdx == -1 {
+			f.connType = f.connType.Next()
+			return m, nil
+		}
+		if f.focusIdx >= 0 && f.focusIdx < len(visible) {
+			fld := visible[f.focusIdx]
+			*fld.value += " "
+		}
+		return m, nil
+
+	case "enter":
+		if f.focusIdx == -1 {
+			f.focusIdx = 0
+			return m, nil
+		}
+		if f.focusIdx < len(visible)-1 {
+			f.focusIdx++
+			return m, nil
+		}
+		if !f.valid() {
+			return m, nil
+		}
+		cfg := f.toConfig()
+		if f.editingIdx >= 0 && f.editingIdx < len(m.configs) {
+			m.configs[f.editingIdx] = cfg
+		} else {
+			m.configs = append(m.configs, cfg)
+			m.wasOnline = append(m.wasOnline, false)
+		}
+		// Rebuild all clients so the shared resolver sees the latest configs.
+		// This matters for DuckLake configs that reference others by name.
+		m.clients = InitClients(m.configs, m.storageSecrets)
+
+		servers := make([]ServerInfo, len(m.configs))
+		for i, c := range m.configs {
+			servers[i] = c.ToServerInfo()
+		}
+		m.scratchpad.servers = servers
+		m.scratchpad.clients = m.clients
+
+		SaveServerConfigs(m.configs)
+		savedIdx := len(m.clients) - 1
+		if f.editingIdx >= 0 {
+			savedIdx = f.editingIdx
+		}
+		m.addForm = nil
+		m.currentView = viewDashboard
+		return m, pingServerCmd(m.clients[savedIdx], savedIdx)
+
+	case "backspace":
+		if f.focusIdx >= 0 && f.focusIdx < len(visible) {
+			fld := visible[f.focusIdx]
+			if len(*fld.value) > 0 {
+				*fld.value = (*fld.value)[:len(*fld.value)-1]
+			}
+		}
+		return m, nil
+
+	default:
+		if f.focusIdx >= 0 && f.focusIdx < len(visible) && len(msg.String()) == 1 {
+			fld := visible[f.focusIdx]
+			*fld.value += msg.String()
+		}
+	}
+	return m, nil
+}
+
+// ── View dispatch ─────────────────────────────────────────────────────────
+
+func (m Model) View() string {
+	if m.width == 0 {
+		return "Initializing Pintail…"
+	}
+	switch m.currentView {
+	case viewTokens:
+		return m.viewTokenManager()
+	case viewScratchpad:
+		return m.viewScratchpadScreen()
+	case viewAddServer:
+		return m.viewAddServerScreen()
+	case viewTLS:
+		return m.viewTLSScreen()
+	case viewAuth:
+		return m.viewAuthScreen()
+	case viewSnapshots:
+		return m.viewSnapshotsScreen()
+	default:
+		return m.viewDashboard()
+	}
+}
+
+// ── Dashboard ─────────────────────────────────────────────────────────────
+
+func (m Model) viewDashboard() string {
+	header := m.viewHeader()
+	footer := m.viewDashboardFooter()
+	headerH := lipgloss.Height(header)
+	footerH := lipgloss.Height(footer)
+	panelH := m.height - headerH - footerH
+
+	leftW := (m.width * 60) / 100
+	rightW := m.width - leftW
+
+	body := lipgloss.JoinHorizontal(lipgloss.Top,
+		m.viewConnectionsPanel(leftW, panelH),
+		m.viewCatalogPanel(rightW, panelH),
+	)
+	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
+}
+
+func (m Model) viewHeader() string {
+	titleBar := headerBarStyle.Width(m.width).Render(
+		titleStyle.Render("🦆 Pintail") +
+			mutedStyle.Render("  ─  DuckDB Quack Protocol Manager  ") +
+			mutedStyle.Render("v0.1.0"),
+	)
+
+	var chips []string
+	for i, cfg := range m.configs {
+		var state ConnState
+		if i < len(m.clients) {
+			state = m.clients[i].GetState()
+		}
+
+		// Status dot
+		var dot string
+		var statusDetail string
+		if state.PingedAt.IsZero() {
+			dot = mutedStyle.Render("◌")
+			statusDetail = mutedStyle.Render(" pinging…")
+		} else if state.Online {
+			dot = greenStyle.Render("●")
+			statusDetail = greenStyle.Render(fmt.Sprintf(" %dms", state.Latency.Milliseconds()))
+			// Type-appropriate transport badge
+			switch cfg.Type {
+			case ConnQuack:
+				if cfg.TLS {
+					statusDetail += mutedStyle.Render(" HTTPS")
+				} else {
+					statusDetail += amberStyle.Render(" HTTP ⚠")
+				}
+			case ConnLocal:
+				statusDetail += mutedStyle.Render(" file")
+			case ConnDuckLake:
+				statusDetail += mutedStyle.Render(" ducklake")
+			}
+		} else {
+			dot = redStyle.Render("✕")
+			statusDetail = redStyle.Render(" offline") + mutedStyle.Render("  "+state.ErrMsg)
+		}
+
+		typeBadge := mutedStyle.Render(" [" + string(cfg.Type) + "]")
+		chip := dot + " " + labelStyle.Render(cfg.Name) +
+			typeBadge +
+			mutedStyle.Render("  "+truncate(cfg.DisplayURI(), 40)) +
+			statusDetail
+		chips = append(chips, chip)
+	}
+
+	activeCount := 0
+	for _, c := range m.connections {
+		if c.Status == "active" {
+			activeCount++
+		}
+	}
+	connSummary := mutedStyle.Render("  connections  ") +
+		greenStyle.Render(fmt.Sprintf("%d active", activeCount)) +
+		mutedStyle.Render(fmt.Sprintf(" / %d total", len(m.connections)))
+
+	serverRow := "  " + strings.Join(chips, mutedStyle.Render("   ·   ")) + connSummary
+	divider := mutedStyle.Render(strings.Repeat("─", m.width))
+	return lipgloss.JoinVertical(lipgloss.Left, titleBar, serverRow, divider)
+}
+
+func (m Model) viewConnectionsPanel(width, height int) string {
+	content := lipgloss.JoinVertical(lipgloss.Left,
+		labelStyle.Render("ACTIVE CONNECTIONS"), "",
+		m.connTable.View(),
+	)
+	style := panelStyle
+	if m.focus == panelConnections {
+		style = activePanelStyle
+	}
+	return style.Width(width - 2).Height(height - 1).Render(content)
+}
+
+func (m Model) viewCatalogPanel(width, height int) string {
+	var lines []string
+	lines = append(lines, labelStyle.Render("DUCKLAKE CATALOG"), "")
+	for _, schema := range m.catalog {
+		arrow := "▶"
+		if schema.Open {
+			arrow = "▼"
+		}
+		lines = append(lines, amberStyle.Render(arrow+" ")+brightStyle.Bold(true).Render(schema.Name))
+		if schema.Open {
+			for i, tbl := range schema.Tables {
+				conn := "├─"
+				if i == len(schema.Tables)-1 {
+					conn = "└─"
+				}
+				lines = append(lines,
+					mutedStyle.Render("  "+conn+" ")+
+						brightStyle.Render(tbl.Name)+
+						mutedStyle.Render("  "+tbl.Format)+
+						mutedStyle.Render("  "+fmtRows(tbl.Rows)))
+			}
+		}
+		lines = append(lines, "")
+	}
+	sep := mutedStyle.Render(strings.Repeat("─", width-6))
+	lines = append(lines, sep,
+		mutedStyle.Render("object store  ")+greenStyle.Render("s3://datalake-prod"),
+		mutedStyle.Render("catalog db    ")+greenStyle.Render("● connected"),
+		mutedStyle.Render("parquet files ")+brightStyle.Render("847"),
+	)
+	style := panelStyle
+	if m.focus == panelCatalog {
+		style = activePanelStyle
+	}
+	return style.Width(width - 2).Height(height - 1).Render(strings.Join(lines, "\n"))
+}
+
+func (m Model) viewDashboardFooter() string {
+	keys := strings.Join([]string{
+		keyBadge("q") + " quit",
+		keyBadge("tab") + " panel",
+		keyBadge("r") + " refresh",
+		keyBadge("t") + " tokens",
+		keyBadge("s") + " sql",
+		keyBadge("l") + " lake",
+		keyBadge("x") + " tls",
+		keyBadge("p") + " auth",
+		keyBadge("a") + " conn",
+	}, "  ")
+	var hint string
+	if m.focus == panelConnections {
+		if row := m.connTable.SelectedRow(); len(row) >= 3 {
+			hint = "   " + mutedStyle.Render("│") + "   " +
+				mutedStyle.Render("selected  ") + brightStyle.Render(row[2]) +
+				mutedStyle.Render("  @  "+row[1])
+		}
+	}
+	divider := mutedStyle.Render(strings.Repeat("─", m.width))
+	return lipgloss.JoinVertical(lipgloss.Left, divider, footerStyle.Render(keys)+hint)
+}
+
+// ── Add server screen ─────────────────────────────────────────────────────
+
+func (m Model) viewAddServerScreen() string {
+	titleBar := headerBarStyle.Width(m.width).Render(
+		titleStyle.Render("🦆 Pintail") +
+			mutedStyle.Render("  ─  ") +
+			labelStyle.Render("Add Connection") +
+			mutedStyle.Render("  v0.1.0"),
+	)
+	divider := mutedStyle.Render(strings.Repeat("─", m.width))
+
+	f := m.addForm
+	visible := f.visibleFields()
+
+	// Type selector at the top of the form
+	var typeChips []string
+	for _, t := range AllConnTypes {
+		chip := mutedStyle.Render(" " + t.Label() + " ")
+		if t == f.connType {
+			chip = lipgloss.NewStyle().
+				Foreground(colorDarkBg).Background(colorDuckYellow).Bold(true).
+				Padding(0, 1).
+				Render(t.Label())
+		}
+		typeChips = append(typeChips, chip)
+	}
+	typeCursor := "  "
+	if f.focusIdx == -1 {
+		typeCursor = amberStyle.Render("▶ ")
+	}
+	typeLine := typeCursor + mutedStyle.Render(padRight("Type", 8)) +
+		strings.Join(typeChips, mutedStyle.Render("  "))
+
+	// Per-type field rows
+	var fieldLines []string
+	for i, fld := range visible {
+		cursor := "  "
+		if i == f.focusIdx {
+			cursor = amberStyle.Render("▶ ")
+		}
+		val := *fld.value
+		if i == f.focusIdx {
+			val += amberStyle.Render("█")
+		}
+		display := brightStyle.Render(val)
+		if *fld.value == "" {
+			display = mutedStyle.Render(fld.placeholder)
+		}
+		fieldLines = append(fieldLines,
+			cursor+mutedStyle.Render(padRight(fld.label, 8))+display,
+			"    "+mutedStyle.Render(fld.hint),
+		)
+	}
+
+	hint := mutedStyle.Render("  [↑↓/tab] field  [←→/space] cycle type  [enter] advance/save  [esc] cancel")
+	if !f.valid() {
+		hint += "  " + redStyle.Render("· required fields missing")
+	}
+
+	// Existing connections panel (left)
+	existingLines := []string{
+		labelStyle.Render("CONFIGURED CONNECTIONS"),
+		mutedStyle.Render("[↑↓] select  [e] edit  [d] delete  [→] back to form"),
+		"",
+	}
+	for i, cfg := range m.configs {
+		state := m.clients[i].GetState()
+		dot := mutedStyle.Render("◌")
+		if !state.PingedAt.IsZero() {
+			if state.Online {
+				dot = greenStyle.Render("●")
+			} else {
+				dot = redStyle.Render("✕")
+			}
+		}
+		cursor := "  "
+		nameStyle := brightStyle
+		if f.focusIdx == -2 && i == f.listCursor {
+			cursor = amberStyle.Render("▶ ")
+			nameStyle = labelStyle
+		}
+		typeLabel := mutedStyle.Render("[" + string(cfg.Type) + "]")
+		editing := ""
+		if f.editingIdx == i {
+			editing = amberStyle.Render("  (editing)")
+		}
+		existingLines = append(existingLines,
+			cursor+dot+" "+nameStyle.Render(cfg.Name)+"  "+typeLabel+editing,
+			"      "+mutedStyle.Render(truncate(cfg.DisplayURI(), 40)),
+		)
+	}
+
+	leftStyle := panelStyle
+	rightStyle := activePanelStyle
+	if f.focusIdx == -2 {
+		leftStyle = activePanelStyle
+		rightStyle = panelStyle
+	}
+	leftPanel := leftStyle.Width((m.width / 2) - 2).Render(strings.Join(existingLines, "\n"))
+	rightPanel := rightStyle.Width((m.width / 2) - 2).Render(
+		lipgloss.JoinVertical(lipgloss.Left,
+			labelStyle.Render(editingTitle(f)), "",
+			typeLine,
+			"",
+			strings.Join(fieldLines, "\n"),
+			"",
+			hint,
+		),
+	)
+
+	body := lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, rightPanel)
+	footerDiv := mutedStyle.Render(strings.Repeat("─", m.width))
+	footerLine := footerStyle.Render(
+		keyBadge("enter") + " save   " + keyBadge("←") + " connection list   " + keyBadge("esc") + " back",
+	)
+	return lipgloss.JoinVertical(lipgloss.Left, titleBar, divider, body, footerDiv, footerLine)
+}
+
+func editingTitle(f *addServerForm) string {
+	if f.editingIdx >= 0 {
+		return "EDIT CONNECTION"
+	}
+	return "NEW CONNECTION"
+}
+
+// ── DuckLake snapshots screen ─────────────────────────────────────────────
+
+func (m Model) viewSnapshotsScreen() string {
+	titleBar := headerBarStyle.Width(m.width).Render(
+		titleStyle.Render("🦆 Pintail") + mutedStyle.Render("  ─  ") +
+			labelStyle.Render("DuckLake Snapshots") + mutedStyle.Render("  v0.1.0"),
+	)
+	divider := mutedStyle.Render(strings.Repeat("─", m.width))
+	header := lipgloss.JoinVertical(lipgloss.Left,
+		titleBar,
+		m.snapshots.ViewTargetBar(),
+		divider,
+	)
+
+	footerDiv := mutedStyle.Render(strings.Repeat("─", m.width))
+	footer := lipgloss.JoinVertical(lipgloss.Left, footerDiv, m.snapshots.ViewFooter())
+
+	headerH := lipgloss.Height(header)
+	footerH := lipgloss.Height(footer)
+	panelH := m.height - headerH - footerH
+
+	leftW := (m.width * 35) / 100
+	rightW := m.width - leftW
+
+	leftContent := m.snapshots.ViewList(leftW - 4)
+	rightContent := m.snapshots.ViewDetail(rightW - 4)
+
+	leftPanel := activePanelStyle.Width(leftW - 2).Height(panelH - 1).Render(leftContent)
+	rightPanel := panelStyle.Width(rightW - 2).Height(panelH - 1).Render(rightContent)
+
+	body := lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, rightPanel)
+	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
+}
+
+// ── Auth policy editor screen ─────────────────────────────────────────────
+
+func (m Model) viewAuthScreen() string {
+	titleBar := headerBarStyle.Width(m.width).Render(
+		titleStyle.Render("🦆 Pintail") + mutedStyle.Render("  ─  ") +
+			labelStyle.Render("Auth Policy Editor") + mutedStyle.Render("  v0.1.0"),
+	)
+	divider := mutedStyle.Render(strings.Repeat("─", m.width))
+	header := lipgloss.JoinVertical(lipgloss.Left, titleBar, divider)
+
+	footerDiv := mutedStyle.Render(strings.Repeat("─", m.width))
+	footer := lipgloss.JoinVertical(lipgloss.Left, footerDiv, m.authEditor.ViewFooter())
+
+	headerH := lipgloss.Height(header)
+	footerH := lipgloss.Height(footer)
+	panelH := m.height - headerH - footerH
+
+	leftW := (m.width * 32) / 100
+	rightW := m.width - leftW
+
+	listContent := m.authEditor.ViewPolicyList(leftW-4, panelH)
+	permContent := m.authEditor.ViewPermGrid(rightW - 4)
+
+	leftStyle := panelStyle
+	rightStyle := panelStyle
+	if m.authEditor.focus == 0 {
+		leftStyle = activePanelStyle
+	} else {
+		rightStyle = activePanelStyle
+	}
+
+	leftPanel := leftStyle.Width(leftW - 2).Height(panelH - 1).Render(listContent)
+	rightPanel := rightStyle.Width(rightW - 2).Height(panelH - 1).Render(permContent)
+
+	body := lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, rightPanel)
+	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
+}
+
+// ── TLS config generator screen ───────────────────────────────────────────
+
+func (m Model) viewTLSScreen() string {
+	titleBar := headerBarStyle.Width(m.width).Render(
+		titleStyle.Render("🦆 Pintail") + mutedStyle.Render("  ─  ") +
+			labelStyle.Render("TLS Config Generator") + mutedStyle.Render("  v0.1.0"),
+	)
+	divider := mutedStyle.Render(strings.Repeat("─", m.width))
+	header := lipgloss.JoinVertical(lipgloss.Left, titleBar, divider)
+
+	footerDiv := mutedStyle.Render(strings.Repeat("─", m.width))
+	statusBar := "  " + m.tlsGen.ViewStatusBar()
+	footer := lipgloss.JoinVertical(lipgloss.Left, footerDiv, statusBar, m.tlsGen.ViewFooter())
+
+	headerH := lipgloss.Height(header)
+	footerH := lipgloss.Height(footer)
+	panelH := m.height - headerH - footerH
+
+	formW := (m.width * 38) / 100
+	configW := m.width - formW
+
+	formContent := m.tlsGen.ViewForm(formW - 4)
+	formPanel := panelStyle.Width(formW - 2).Height(panelH - 1).Render(formContent)
+
+	configPanel := activePanelStyle.Width(configW - 2).Height(panelH - 1).Render(
+		m.tlsGen.ViewConfig(),
+	)
+
+	body := lipgloss.JoinHorizontal(lipgloss.Top, formPanel, configPanel)
+	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
+}
+
+// ── Token manager (mode-aware: dispatches between tokens and secrets) ────
+
+func (m Model) viewTokenManager() string {
+	header := m.viewTokenHeader()
+	footer := m.viewTokenFooter()
+	headerH := lipgloss.Height(header)
+	footerH := lipgloss.Height(footer)
+	panelH := m.height - headerH - footerH
+
+	leftW := (m.width * 30) / 100
+	rightW := m.width - leftW
+
+	var leftContent, rightContent string
+
+	if m.tokenMgr.mode == tmModeSecrets {
+		// Secrets mode
+		leftContent = m.tokenMgr.ViewSecretList(leftW-4, panelH)
+		switch {
+		case m.tokenMgr.secretForm != nil:
+			rightContent = lipgloss.JoinVertical(lipgloss.Left,
+				m.tokenMgr.ViewSecretDetail(rightW-6), "",
+				lipgloss.PlaceHorizontal(rightW-4, lipgloss.Center,
+					m.tokenMgr.ViewSecretForm(rightW-12, panelH)),
+			)
+		case m.tokenMgr.secretDelConfirm:
+			sel := m.tokenMgr.selectedSecret()
+			name := ""
+			if sel != nil {
+				name = sel.Name
+			}
+			rightContent = lipgloss.JoinVertical(lipgloss.Left,
+				m.tokenMgr.ViewSecretDetail(rightW-6), "",
+				lipgloss.PlaceHorizontal(rightW-4, lipgloss.Left,
+					m.tokenMgr.ViewConfirmDialog("Delete secret",
+						fmt.Sprintf("Delete the secret  %s?\nConnections that reference it will fail until reconfigured.", name)),
+				))
+		default:
+			rightContent = m.tokenMgr.ViewSecretDetail(rightW - 6)
+		}
+	} else {
+		// Tokens mode (original behaviour)
+		leftContent = m.tokenMgr.ViewTokenList(leftW-4, panelH)
+		switch {
+		case m.tokenMgr.form != nil:
+			rightContent = lipgloss.JoinVertical(lipgloss.Left,
+				m.tokenMgr.ViewTokenDetail(rightW-6), "",
+				lipgloss.PlaceHorizontal(rightW-4, lipgloss.Center, m.tokenMgr.ViewForm(rightW, panelH)),
+			)
+		case m.tokenMgr.rotateConfirm:
+			sel := m.tokenMgr.selectedToken()
+			name := ""
+			if sel != nil {
+				name = sel.Name
+			}
+			rightContent = lipgloss.JoinVertical(lipgloss.Left,
+				m.tokenMgr.ViewTokenDetail(rightW-6), "",
+				lipgloss.PlaceHorizontal(rightW-4, lipgloss.Left,
+					m.tokenMgr.ViewConfirmDialog("Rotate token",
+						fmt.Sprintf("Generate a new value for  %s?\nThe old value will stop working immediately.", name)),
+				))
+		case m.tokenMgr.revokeConfirm:
+			sel := m.tokenMgr.selectedToken()
+			name := ""
+			if sel != nil {
+				name = sel.Name
+			}
+			rightContent = lipgloss.JoinVertical(lipgloss.Left,
+				m.tokenMgr.ViewTokenDetail(rightW-6), "",
+				lipgloss.PlaceHorizontal(rightW-4, lipgloss.Left,
+					m.tokenMgr.ViewConfirmDialog("Revoke token",
+						fmt.Sprintf("Permanently revoke  %s?\nAll connections using it will be dropped.", name)),
+				))
+		default:
+			rightContent = m.tokenMgr.ViewTokenDetail(rightW - 6)
+		}
+	}
+
+	leftPanel := panelStyle.Width(leftW - 2).Height(panelH - 1).Render(leftContent)
+	rightPanel := activePanelStyle.Width(rightW - 2).Height(panelH - 1).Render(rightContent)
+	body := lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, rightPanel)
+	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
+}
+
+func (m Model) viewTokenHeader() string {
+	titleBar := headerBarStyle.Width(m.width).Render(
+		titleStyle.Render("🦆 Pintail") + mutedStyle.Render("  ─  ") +
+			labelStyle.Render("Token Manager") + mutedStyle.Render("  v0.1.0"),
+	)
+	activeTokens := 0
+	for _, t := range m.tokenMgr.tokens {
+		if t.Active {
+			activeTokens++
+		}
+	}
+	statRow := "  " +
+		mutedStyle.Render("tokens  ") +
+		greenStyle.Render(fmt.Sprintf("%d active", activeTokens)) +
+		mutedStyle.Render(fmt.Sprintf(" / %d total", len(m.tokenMgr.tokens)))
+	divider := mutedStyle.Render(strings.Repeat("─", m.width))
+	return lipgloss.JoinVertical(lipgloss.Left, titleBar, statRow, divider)
+}
+
+func (m Model) viewTokenFooter() string {
+	divider := mutedStyle.Render(strings.Repeat("─", m.width))
+	return lipgloss.JoinVertical(lipgloss.Left, divider, m.tokenMgr.ViewFooter())
+}
+
+// ── Scratchpad screen ─────────────────────────────────────────────────────
+
+func (m Model) viewScratchpadScreen() string {
+	titleBar := headerBarStyle.Width(m.width).Render(
+		titleStyle.Render("🦆 Pintail") + mutedStyle.Render("  ─  ") +
+			labelStyle.Render("SQL Scratchpad") + mutedStyle.Render("  v0.1.0"),
+	)
+	divider := mutedStyle.Render(strings.Repeat("─", m.width))
+	header := lipgloss.JoinVertical(lipgloss.Left, titleBar, divider)
+
+	footerDivider := mutedStyle.Render(strings.Repeat("─", m.width))
+	footer := lipgloss.JoinVertical(lipgloss.Left, footerDivider, m.scratchpad.ViewFooter())
+
+	return lipgloss.JoinVertical(lipgloss.Left,
+		header,
+		m.scratchpad.ViewEditor(),
+		"",
+		m.scratchpad.ViewResultsStatus(),
+		m.scratchpad.ViewResults(),
+		footer,
+	)
+}
+
+// ── format helpers ────────────────────────────────────────────────────────
+
+func connectionRows(conns []Connection) []table.Row {
+	rows := make([]table.Row, len(conns))
+	for i, c := range conns {
+		rows[i] = table.Row{
+			c.ID, c.IP, c.Identity, c.Catalog,
+			fmtDuration(c.Duration), fmt.Sprintf("%d", c.Queries),
+			statusGlyph(c.Status) + c.Status,
+		}
+	}
+	return rows
+}
+
+func statusGlyph(s string) string {
+	switch s {
+	case "active":
+		return "● "
+	case "idle":
+		return "◌ "
+	case "error":
+		return "✕ "
+	}
+	return "  "
+}
+
+func fmtDuration(d time.Duration) string {
+	h := int(d.Hours())
+	mn := int(d.Minutes()) % 60
+	sc := int(d.Seconds()) % 60
+	if h > 0 {
+		return fmt.Sprintf("%dh%02dm", h, mn)
+	}
+	if mn > 0 {
+		return fmt.Sprintf("%dm%02ds", mn, sc)
+	}
+	return fmt.Sprintf("%ds", sc)
+}
+
+func fmtRows(n int64) string {
+	switch {
+	case n >= 1_000_000_000:
+		return fmt.Sprintf("%.1fB rows", float64(n)/1_000_000_000)
+	case n >= 1_000_000:
+		return fmt.Sprintf("%.1fM rows", float64(n)/1_000_000)
+	case n >= 1_000:
+		return fmt.Sprintf("%.1fK rows", float64(n)/1_000)
+	}
+	return fmt.Sprintf("%d rows", n)
+}
