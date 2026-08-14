@@ -24,6 +24,7 @@ const (
 	viewTLS
 	viewAuth
 	viewSnapshots
+	viewLogs
 )
 
 type panel int
@@ -490,6 +491,9 @@ type Model struct {
 	// ducklake snapshots
 	snapshots SnapshotsView
 
+	// quack message log
+	logs LogsView
+
 	// tls config generator
 	tlsGen TLSGenerator
 
@@ -520,6 +524,7 @@ func NewModel() Model {
 		tlsGen:         NewTLSGenerator(configs),
 		authEditor:     NewAuthEditor(LoadTokens(), clients),
 		snapshots:      NewSnapshotsView(clients),
+		logs:           NewLogsView(clients),
 	}
 	m.connTable = buildConnectionTable(nil)
 	return m
@@ -676,6 +681,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.snapshots, snapCmd = m.snapshots.Update(msg)
 		return m, snapCmd
 
+	// ── quack log results ─────────────────────────────────────────────────
+	case logsResultMsg:
+		var logCmd tea.Cmd
+		m.logs, logCmd = m.logs.Update(msg)
+		return m, logCmd
+
+	case logsEnabledMsg:
+		var logCmd tea.Cmd
+		m.logs, logCmd = m.logs.Update(msg)
+		return m, logCmd
+
 	// ── auth policy apply result ──────────────────────────────────────────
 	case authApplyResultMsg:
 		var authCmd tea.Cmd
@@ -726,6 +742,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, m.snapshots.FetchCmd()
 				}
 				return m, nil
+			case "L":
+				// Rebuilt from current clients, like the snapshots screen.
+				m.logs = NewLogsView(m.clients)
+				m.currentView = viewLogs
+				if m.logs.HasTarget() {
+					m.logs.loading = true
+					return m, m.logs.FetchCmd()
+				}
+				return m, nil
+
 			case "x":
 				m.tlsGen.SetWidth(m.width)
 				m.currentView = viewTLS
@@ -827,6 +853,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			var snapCmd tea.Cmd
 			m.snapshots, snapCmd = m.snapshots.Update(msg)
 			return m, snapCmd
+
+		case viewLogs:
+			if msg.String() == "esc" {
+				m.currentView = viewDashboard
+				return m, nil
+			}
+			var logCmd tea.Cmd
+			m.logs, logCmd = m.logs.Update(msg)
+			return m, logCmd
 
 		case viewAddServer:
 			return m.updateAddServer(msg)
@@ -1115,6 +1150,8 @@ func (m Model) View() string {
 		return m.viewAuthScreen()
 	case viewSnapshots:
 		return m.viewSnapshotsScreen()
+	case viewLogs:
+		return m.viewLogsScreen()
 	default:
 		return m.viewDashboard()
 	}
@@ -1341,6 +1378,7 @@ func (m Model) viewDashboardFooter() string {
 		keyBadge("t") + " tokens",
 		keyBadge("s") + " sql",
 		keyBadge("l") + " lake",
+		keyBadge("L") + " logs",
 		keyBadge("x") + " tls",
 		keyBadge("p") + " auth",
 		keyBadge("a") + " conn",
@@ -1544,6 +1582,34 @@ func (m Model) viewSnapshotsScreen() string {
 
 	body := lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, rightPanel)
 	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
+}
+
+// ── Quack message log screen ──────────────────────────────────────────────
+
+func (m Model) viewLogsScreen() string {
+	titleBar := headerBarStyle.Width(m.width).Render(
+		titleStyle.Render("🦆 Pintail") + mutedStyle.Render("  ─  ") +
+			labelStyle.Render("Quack Message Log") + mutedStyle.Render("  "+versionLabel()),
+	)
+	divider := mutedStyle.Render(strings.Repeat("─", m.width))
+	header := lipgloss.JoinVertical(lipgloss.Left, titleBar, m.logs.ViewTargetBar(), divider)
+
+	footerDiv := mutedStyle.Render(strings.Repeat("─", m.width))
+	footer := lipgloss.JoinVertical(lipgloss.Left, footerDiv, m.logs.ViewFooter())
+
+	panelH := m.height - lipgloss.Height(header) - lipgloss.Height(footer)
+
+	// The log is a wide stream, so it gets the full width and the detail for the
+	// selected entry sits underneath rather than beside it.
+	tableH := (panelH * 60) / 100
+	detailH := panelH - tableH
+
+	table := activePanelStyle.Width(m.width - 2).Height(tableH - 2).Render(
+		m.logs.ViewTable(m.width - 6))
+	detail := panelStyle.Width(m.width - 2).Height(detailH - 2).Render(
+		m.logs.ViewDetail(m.width - 6))
+
+	return lipgloss.JoinVertical(lipgloss.Left, header, table, detail, footer)
 }
 
 // ── Auth policy editor screen ─────────────────────────────────────────────

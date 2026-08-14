@@ -25,9 +25,17 @@
 
 Pintail is for the operational side of running DuckDB-as-a-server:
 connection topology, token administration, TLS reverse-proxy generation,
-DuckLake snapshot inspection, per-token auth policy editing, and a small
-SQL scratchpad for quick admin checks. It targets teams running Quack
-in production with multi-writer DuckLake setups — not data analysts.
+DuckLake snapshot inspection, auth policy editing, request-log inspection, and
+a small SQL scratchpad for quick admin checks. It is aimed at people operating
+Quack and multi-writer DuckLake setups — not at data analysts.
+
+> **Quack itself is beta.** Upstream describes it as a pre-release extension
+> that is *"not ready for production and subject to breaking changes until the
+> release of DuckDB v2.0"*, with function names, settings and defaults still
+> liable to change. Pintail is built against the versions listed under
+> [Verified against](#verified-against); a rename upstream will break the
+> queries it generates. `FORCE INSTALL quack;` is upstream's advice when
+> clients disagree.
 
 Built with [Bubble Tea](https://github.com/charmbracelet/bubbletea),
 [Bubbles](https://github.com/charmbracelet/bubbles), and
@@ -45,7 +53,7 @@ binary; shells out to the `duckdb` CLI for live operations.
 │ ID   IP Address      Identity   Status   │ │ ▼ analytics                 │
 │ 2    10.0.1.5        analyst1   ● active │ │   ├─ orders   table 4.8M    │
 ╰──────────────────────────────────────────╯ ╰─────────────────────────────╯
- q quit  tab panel  [ ] connection  r refresh  t tokens  s sql  l lake  x tls  p auth  a conn
+ q quit  tab panel  [ ] connection  r refresh  t tokens  s sql  l lake  L logs  x tls  p auth  a conn
 ```
 
 ## What this is — and isn't
@@ -253,6 +261,7 @@ or a bare path to a `.duckdb` or `.sqlite` file (extension-based detection).
 | **DuckLake snapshots**  | `l` | List `<catalog>.snapshots()`; renders time-travel and `ducklake_expire_snapshots` SQL                                   |
 | **TLS config**          | `x` | Generate Caddy / Nginx / Envoy reverse-proxy configs for HTTPS termination                                              |
 | **Auth policy**         | `p` | Toggle SQL permissions (saved back to the token list); generate and apply Quack's authorization hook macro               |
+| **Message log**         | `L` | Read the server's Quack request log: message type, connection id, duration, and the SQL of each request                  |
 | **Connections**         | `a` | Add, edit, delete connections; persisted to `~/.duckdb/pintail.json`                                                   |
 
 ### Storage secrets
@@ -324,6 +333,25 @@ from the right and the count is reported under the table (`+ 2 more columns`),
 so a wide result never looks complete when it isn't. Column widths are measured
 in terminal cells, so CJK text and emoji line up.
 
+### Message log
+
+`L` opens the server's Quack request log, read from
+`duckdb_logs_parsed('Quack')` on the server itself (via `quack_query`, since the
+log lives where the messages were handled). Each row is one protocol message:
+its type (`PREPARE_REQUEST`, `FETCH_REQUEST`, …), the server-issued connection
+id, the round-trip duration in milliseconds, the response type, and the SQL for
+requests that carry it. Failed messages are highlighted, and the panel below
+shows the selected entry in full — including the error, which has no column.
+
+Logging is **off until it is turned on**, and turning it on changes state on
+someone's server, so Pintail never does it as part of a poll: press `e` to run
+`CALL enable_logging('Quack')` on the target, then `r` to refresh. Pintail's own
+log-reading query is filtered out of the results.
+
+If the fetch fails with `structured_log_schema: 'Quack' not found`, the log type
+is not registered on that instance — it appears once the `quack` extension is
+loaded there.
+
 ### Scratchpad export
 
 After running a query, `ctrl+e` opens an export prompt: `c` writes CSV
@@ -389,6 +417,37 @@ Every result is stored against the connection that produced it, so polls from
 several servers don't overwrite each other, and both dashboard panels name the
 connection they're describing. A failed refresh keeps the last known-good
 listing and shows the backend's error above it rather than blanking the panel.
+
+## Verified against
+
+Pintail generates SQL and proxy configuration for a protocol that is still
+changing, so the checks behind it are worth naming. The behaviour below was
+verified against:
+
+| Component | Version | How |
+|-----------|---------|-----|
+| DuckDB CLI | `v1.5.5` (Variegata) | Queries run against a real binary — the integration tests do this in CI |
+| `duckdb-quack` | `main` @ `7e80f7f` (2026-07-20) | Extension sources read for the wire protocol, ATTACH options, SSL defaults, and `quack_active_connections()` |
+| `ducklake` | `main` @ `3d8e24a` (2026-08-13) | Sources read for `snapshots()`, `AT (VERSION => …)` and `ducklake_expire_snapshots` |
+| Quack docs | `docs/current/quack/*` | Overview, reference, security, and the reverse-proxy guide |
+
+What that means concretely:
+
+- **Executed against DuckDB 1.5.5**: the catalog query (`duckdb_tables()` /
+  `duckdb_views()`), the session-facts query, `enable_logging` /
+  `duckdb_logs_parsed`, and the scratchpad's own error and cancellation paths.
+  These are covered by tests that skip when `duckdb` is absent.
+- **Read from sources or docs, not executed**: everything that needs a running
+  Quack server or the `ducklake` extension — the `ATTACH … (TOKEN …,
+  DISABLE_SSL …)` form, `quack_query`, `quack_active_connections()`, the
+  authorization hook, and the DuckLake snapshot SQL. The extension host is
+  unreachable from the environment this was developed in, so these match the
+  published sources and docs but have not been round-tripped against a live
+  server.
+
+If you run Pintail against a newer Quack than the above and something breaks,
+the generated SQL in each screen is visible on screen for exactly that reason:
+copy it, adjust it, and open an issue.
 
 ## Building
 
@@ -475,13 +534,15 @@ Other files written under `~/.duckdb/`:
 
 ## Keybindings
 
-**Dashboard:** `q` quit · `tab` switch panel · `↑↓` navigate · `[`/`]` or `1`–`9` select connection · `r` refresh · `t` tokens · `s` sql · `l` lake · `x` tls · `p` auth · `a` conn
+**Dashboard:** `q` quit · `tab` switch panel · `↑↓` navigate · `[`/`]` or `1`–`9` select connection · `r` refresh · `t` tokens · `s` sql · `l` lake · `L` logs · `x` tls · `p` auth · `a` conn
 
 **Secrets manager (`t`):** `tab` switch mode<span></span>· in **Quack tokens** mode: `↑↓` select · `n` new · `r` rotate · `d` revoke · `v` reveal · `e` export · `esc` back<span></span>· in **Storage secrets** mode: `↑↓` select · `n` new · `d` delete · `v` reveal · `e` export · `←→` cycle secret type in form · `esc` back
 
 **SQL scratchpad:** `ctrl+r` run · `ctrl+c`/`esc` interrupt a running query · `ctrl+p`/`ctrl+n` history · `ctrl+e` export · `pgup`/`pgdn` scroll · `ctrl+l` clear · `tab` cycle target · `esc` back
 
 **DuckLake snapshots:** `↑↓` select · `r` refresh · `tab` cycle lake (if many) · `esc` back
+
+**Message log (`L`):** `↑↓` select · `r` refresh · `e` enable logging on the server · `tab` cycle server (if many) · `esc` back
 
 **TLS config:** `↑↓` field · `tab` proxy type · `pgup`/`pgdn` scroll · `ctrl+s` save · `esc` back
 
@@ -502,6 +563,7 @@ pintail/
 ├── tokens.go      — Quack token manager (mode 1 of the secrets screen)
 ├── secrets.go     — Storage secret manager (mode 2 of the secrets screen)
 ├── ducklake.go    — snapshots view, time-travel / expire-snapshots SQL
+├── logs.go        — Quack message-log view
 ├── tls.go         — Caddy / Nginx / Envoy config generators
 ├── auth.go        — permission grid + Quack authorization-hook generator
 ├── version.go     — version string, stampable with -ldflags
