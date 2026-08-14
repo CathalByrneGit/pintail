@@ -760,7 +760,15 @@ func (m Model) updateAddServer(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case "right", " ":
+	case "right":
+		// Only meaningful on the type row. On a text field it used to append a
+		// space, so pressing → while editing silently corrupted the value.
+		if f.focusIdx == -1 {
+			f.connType = f.connType.Next()
+		}
+		return m, nil
+
+	case " ":
 		if f.focusIdx == -1 {
 			f.connType = f.connType.Next()
 			return m, nil

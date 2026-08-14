@@ -122,7 +122,8 @@ Then add a DuckLake connection in Pintail:
 - Storage: `/tmp/lake/data`
 
 The snapshots screen (`l`) now lists real snapshots; the catalog panel
-populates from `information_schema.tables`; queries actually return rows.
+populates from `duckdb_tables()` / `duckdb_views()`; queries actually
+return rows.
 
 ### 3. A real Quack server (using DuckDB's built-in `quack` extension)
 
@@ -156,8 +157,9 @@ In another terminal, launch Pintail and add a Quack connection:
 - `enter` to save
 
 The connection chip flips from `× offline` to `● online`, the sessions
-panel populates from `duckdb_connections()` on the server, and the
-catalog tree shows the real tables. The scratchpad now runs queries via
+panel reports the session's own connection plus the backend's connection
+count (DuckDB exposes no per-connection listing), and the catalog tree
+shows the real tables. The scratchpad now runs queries via
 HTTP to the Quack server.
 
 **For external access**, bind to a non-local interface and front with a
@@ -371,7 +373,7 @@ Other files written under `~/.duckdb/`:
 
 - `pintail_tokens.sql` — exported `CREATE SECRET` statements for Quack tokens (`e` in tokens mode)
 - `pintail_storage_secrets.sql` — exported `CREATE SECRET` statements for storage credentials (`e` in secrets mode)
-- `tls/pintail-{Caddyfile,nginx.conf,envoy.yaml}` — exported proxy configs (`e` in TLS screen)
+- `tls/pintail-{Caddyfile,nginx.conf,envoy.yaml}` — exported proxy configs (`ctrl+s` in TLS screen)
 - `exports/pintail-{ts}.{csv,parquet}` — scratchpad audit exports (`ctrl+e`)
 
 ## Keybindings
@@ -384,7 +386,7 @@ Other files written under `~/.duckdb/`:
 
 **DuckLake snapshots:** `↑↓` select · `r` refresh · `tab` cycle lake (if many) · `esc` back
 
-**TLS config:** `↑↓` field · `tab` proxy type · `pgup`/`pgdn` scroll · `e` save · `esc` back
+**TLS config:** `↑↓` field · `tab` proxy type · `pgup`/`pgdn` scroll · `ctrl+s` save · `esc` back
 
 **Auth policy:** `↑↓` select · `tab` switch panel · `space` toggle · `a` apply · `esc` back
 

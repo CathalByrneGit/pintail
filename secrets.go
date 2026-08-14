@@ -189,7 +189,15 @@ func (tm TokenManager) updateSecretForm(msg tea.KeyMsg) (TokenManager, tea.Cmd) 
 		}
 		return tm, nil
 
-	case "right", " ":
+	case "right":
+		// Type row only — appending a space on a text field meant → quietly
+		// corrupted whatever was being typed.
+		if f.focusIdx == -1 {
+			f.sectype = f.sectype.Next()
+		}
+		return tm, nil
+
+	case " ":
 		if f.focusIdx == -1 {
 			f.sectype = f.sectype.Next()
 			return tm, nil

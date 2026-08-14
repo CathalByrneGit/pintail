@@ -46,6 +46,7 @@ type TLSGenerator struct {
 
 	savedPath string
 	savedAt   time.Time
+	saveErr   string
 }
 
 // ── constructor ───────────────────────────────────────────────────────────
@@ -127,11 +128,22 @@ func (g TLSGenerator) Update(msg tea.Msg) (TLSGenerator, tea.Cmd) {
 		case "pgdown", "ctrl+f":
 			g.configVP, _ = g.configVP.Update(msg)
 
-		case "e":
-			if path, err := g.saveToFile(); err == nil {
-				g.savedPath = path
+		// Save is ctrl+s, not "e": every field on this screen is free text, and
+		// binding a bare letter made it impossible to type — "quack.example.com"
+		// could not be entered into the Domain field at all.
+		case "ctrl+s":
+			path, err := g.saveToFile()
+			if err != nil {
+				// Silently ignoring this made a failed write look identical to
+				// a successful one.
+				g.saveErr = err.Error()
+				g.savedPath = ""
 				g.savedAt = time.Now()
+				break
 			}
+			g.saveErr = ""
+			g.savedPath = path
+			g.savedAt = time.Now()
 
 		default:
 			if len(msg.String()) == 1 {
@@ -221,6 +233,9 @@ func (g TLSGenerator) ViewConfig() string {
 }
 
 func (g TLSGenerator) ViewStatusBar() string {
+	if g.saveErr != "" && time.Since(g.savedAt) < 8*time.Second {
+		return "  " + redStyle.Render("✕ save failed: ") + brightStyle.Render(g.saveErr)
+	}
 	if g.savedPath != "" && time.Since(g.savedAt) < 5*time.Second {
 		return "  " + greenStyle.Render("✓ saved → "+g.savedPath)
 	}
@@ -233,7 +248,7 @@ func (g TLSGenerator) ViewFooter() string {
 		keyBadge("↑↓") + " field",
 		keyBadge("tab") + " proxy",
 		keyBadge("pgup/dn") + " scroll",
-		keyBadge("e") + " save file",
+		keyBadge("ctrl+s") + " save file",
 		keyBadge("esc") + " back",
 	}, "   ")
 	return footerStyle.Render(keys)
@@ -424,9 +439,14 @@ admin:
 // ── file export ───────────────────────────────────────────────────────────
 
 func (g TLSGenerator) saveToFile() (string, error) {
-	home, _ := os.UserHomeDir()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("cannot locate home directory: %w", err)
+	}
 	dir := filepath.Join(home, ".duckdb", "tls")
-	os.MkdirAll(dir, 0750)
+	if err := os.MkdirAll(dir, 0750); err != nil {
+		return "", err
+	}
 
 	name := fmt.Sprintf("pintail-%s", g.proxy.FileExt())
 	path := filepath.Join(dir, name)
