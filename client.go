@@ -158,27 +158,35 @@ type StorageSecret struct {
 	CreatedAt time.Time  `json:"created_at,omitempty"`
 }
 
+// sqlQuote escapes a value for use inside a single-quoted SQL literal. Every
+// generated statement here is handed to `duckdb -c`, so an unescaped quote in a
+// token, path or secret produced a broken script (TOKEN 'ab'cd') rather than a
+// working one.
+func sqlQuote(s string) string {
+	return strings.ReplaceAll(s, "'", "''")
+}
+
 // parts returns the per-type field list used to build CREATE SECRET SQL.
 func (s StorageSecret) parts() []string {
 	out := []string{"TYPE " + string(s.Type)}
 	switch s.Type {
 	case SecretS3:
-		out = append(out, fmt.Sprintf("KEY_ID '%s'", s.KeyID), fmt.Sprintf("SECRET '%s'", s.Secret))
+		out = append(out, fmt.Sprintf("KEY_ID '%s'", sqlQuote(s.KeyID)), fmt.Sprintf("SECRET '%s'", sqlQuote(s.Secret)))
 		if s.Region != "" {
-			out = append(out, fmt.Sprintf("REGION '%s'", s.Region))
+			out = append(out, fmt.Sprintf("REGION '%s'", sqlQuote(s.Region)))
 		}
 	case SecretR2:
 		out = append(out,
-			fmt.Sprintf("KEY_ID '%s'", s.KeyID),
-			fmt.Sprintf("SECRET '%s'", s.Secret),
-			fmt.Sprintf("ACCOUNT_ID '%s'", s.AccountID))
+			fmt.Sprintf("KEY_ID '%s'", sqlQuote(s.KeyID)),
+			fmt.Sprintf("SECRET '%s'", sqlQuote(s.Secret)),
+			fmt.Sprintf("ACCOUNT_ID '%s'", sqlQuote(s.AccountID)))
 	case SecretGCS:
-		out = append(out, fmt.Sprintf("KEY_ID '%s'", s.KeyID), fmt.Sprintf("SECRET '%s'", s.Secret))
+		out = append(out, fmt.Sprintf("KEY_ID '%s'", sqlQuote(s.KeyID)), fmt.Sprintf("SECRET '%s'", sqlQuote(s.Secret)))
 	case SecretAzure:
-		out = append(out, fmt.Sprintf("CONNECTION_STRING '%s'", s.ConnStr))
+		out = append(out, fmt.Sprintf("CONNECTION_STRING '%s'", sqlQuote(s.ConnStr)))
 	}
 	if s.Scope != "" {
-		out = append(out, fmt.Sprintf("SCOPE '%s'", s.Scope))
+		out = append(out, fmt.Sprintf("SCOPE '%s'", sqlQuote(s.Scope)))
 	}
 	return out
 }
@@ -243,6 +251,15 @@ func (c ServerConfig) Addr() string {
 	return fmt.Sprintf("%s:%d", c.Host, c.Port)
 }
 
+// LocalIsRemote reports whether a local-type connection points at a URI rather
+// than a file on disk (s3://bucket/db.duckdb and friends, which the README
+// documents as supported). Such a path cannot be stat'd, and cannot be opened
+// as duckdb's positional argument either: the storage secret has to exist
+// before the database is opened, so it needs the ATTACH form instead.
+func (c ServerConfig) LocalIsRemote() bool {
+	return c.Type == ConnLocal && strings.Contains(c.Path, "://")
+}
+
 func (c ServerConfig) BaseURL() string {
 	scheme := "http"
 	if c.TLS {
@@ -301,10 +318,18 @@ func (c ServerConfig) AttachPrefix(resolve ConfigResolver, resolveSecret SecretR
 
 	// 2. Type-specific attach.
 	switch c.Type {
+	case ConnLocal:
+		// On-disk files are opened positionally by the caller, so nothing to
+		// attach. A remote path has to be attached after the secret exists —
+		// and read-only, which is all DuckDB supports over object storage.
+		if c.LocalIsRemote() {
+			b.WriteString(fmt.Sprintf(
+				"ATTACH '%s' AS _local (READ_ONLY); USE _local; ", sqlQuote(c.Path)))
+		}
 	case ConnQuack:
 		b.WriteString(fmt.Sprintf(
 			"ATTACH '%s' AS _remote (TOKEN '%s'); USE _remote; ",
-			c.QuackURI(), c.Token,
+			c.QuackURI(), sqlQuote(c.Token),
 		))
 	case ConnDuckLake:
 		if c.CatalogRef != "" && resolve != nil {
@@ -312,14 +337,14 @@ func (c ServerConfig) AttachPrefix(resolve ConfigResolver, resolveSecret SecretR
 				catalogAttach := buildCatalogAttach(catCfg)
 				b.WriteString(fmt.Sprintf(
 					"INSTALL ducklake; LOAD ducklake; %sATTACH 'ducklake:_catalog' AS _lake (DATA_PATH '%s'); USE _lake; ",
-					catalogAttach, c.StoragePath,
+					catalogAttach, sqlQuote(c.StoragePath),
 				))
 				return b.String()
 			}
 		}
 		b.WriteString(fmt.Sprintf(
 			"INSTALL ducklake; LOAD ducklake; ATTACH 'ducklake:%s' AS _lake (DATA_PATH '%s'); USE _lake; ",
-			c.CatalogPath, c.StoragePath,
+			sqlQuote(c.CatalogPath), sqlQuote(c.StoragePath),
 		))
 	}
 	return b.String()
@@ -332,13 +357,13 @@ func buildCatalogAttach(catCfg ServerConfig) string {
 	case ConnQuack:
 		return fmt.Sprintf(
 			"ATTACH '%s' AS _catalog (TOKEN '%s'); ",
-			catCfg.QuackURI(), catCfg.Token,
+			catCfg.QuackURI(), sqlQuote(catCfg.Token),
 		)
 	case ConnLocal:
-		return fmt.Sprintf("ATTACH '%s' AS _catalog; ", catCfg.Path)
+		return fmt.Sprintf("ATTACH '%s' AS _catalog; ", sqlQuote(catCfg.Path))
 	default:
 		// Treat as freeform URL (postgres://, mysql://, etc.)
-		return fmt.Sprintf("ATTACH '%s' AS _catalog; ", catCfg.CatalogPath)
+		return fmt.Sprintf("ATTACH '%s' AS _catalog; ", sqlQuote(catCfg.CatalogPath))
 	}
 }
 
@@ -477,7 +502,20 @@ func (c *QuackClient) pingTCP(ctx context.Context) (time.Duration, error) {
 }
 
 // pingLocal stats the .duckdb file and verifies it's a regular file.
+//
+// A remote path (s3://…) cannot be stat'd, and probing it properly would mean
+// spawning duckdb on every 5s tick — which is exactly what the ping cadence
+// exists to avoid. Such connections are reported as unprobed rather than as
+// missing files: queries are attempted, and the first one surfaces the real
+// error if the path or credentials are wrong.
 func (c *QuackClient) pingLocal() (time.Duration, error) {
+	if c.Config.LocalIsRemote() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.state = ConnState{Online: true, PingedAt: time.Now(), Method: "uri"}
+		return 0, nil
+	}
+
 	start := time.Now()
 	info, err := os.Stat(c.Config.Path)
 	latency := time.Since(start)
@@ -619,21 +657,26 @@ func (c *QuackClient) QueryAsync(sql string, fallbackSrv ServerInfo) tea.Cmd {
 	}
 }
 
-// queryCLI shells out to the duckdb binary, dispatching by connection type.
-// Local: opens the .duckdb file directly via argv.
-// Quack / DuckLake: prepends the appropriate ATTACH + USE so user queries
-// can use unqualified table names.
-func (c *QuackClient) queryCLI(ctx context.Context, sql string) (*QueryResult, error) {
-	var args []string
-	switch c.Config.Type {
-	case ConnLocal:
-		args = []string{c.Config.Path, "-json", "-c", sql}
-	default:
-		script := c.attachPrefix() + sql
-		args = []string{"-json", "-c", script}
+// cliArgs builds the duckdb argv for a script.
+//
+// A local file on disk is opened positionally; everything else is reached with
+// the ATTACH + USE prologue so unqualified table names resolve. The prologue is
+// prepended for *every* type, including local: it is empty for a plain local
+// file, but carries the CREATE SECRET when the connection references a storage
+// secret. Local connections previously skipped it entirely, so the documented
+// combination of a local path plus storage_secret_ref silently did nothing.
+func (c *QuackClient) cliArgs(sql string, flags ...string) []string {
+	args := make([]string, 0, len(flags)+3)
+	if c.Config.Type == ConnLocal && !c.Config.LocalIsRemote() {
+		args = append(args, c.Config.Path)
 	}
+	args = append(args, flags...)
+	return append(args, "-c", c.attachPrefix()+sql)
+}
 
-	cmd := exec.CommandContext(ctx, c.cliPath, args...)
+// queryCLI shells out to the duckdb binary with the argv from cliArgs.
+func (c *QuackClient) queryCLI(ctx context.Context, sql string) (*QueryResult, error) {
+	cmd := exec.CommandContext(ctx, c.cliPath, c.cliArgs(sql, "-json")...)
 	out, err := cmd.Output()
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok && len(ee.Stderr) > 0 {
@@ -777,8 +820,7 @@ func (c *QuackClient) fetchQuackSessions(ctx context.Context) tea.Msg {
 	               session_user()          AS client_context,
 	               current_database()      AS catalog,
 	               (SELECT count FROM duckdb_connection_count()) AS connection_count;`
-	script := c.attachPrefix() + sql
-	cmd := exec.CommandContext(ctx, c.cliPath, "-json", "-c", script)
+	cmd := exec.CommandContext(ctx, c.cliPath, c.cliArgs(sql, "-json")...)
 	out, err := cmd.Output()
 	if err != nil {
 		return sessionResultMsg{err: fmt.Errorf("session query: %s", cliError(err))}
@@ -801,8 +843,7 @@ func (c *QuackClient) fetchDuckLakeSnapshots(ctx context.Context) tea.Msg {
 	// default schema, expanding to ducklake_snapshots('_lake'); either spelling
 	// works once ATTACH ... AS _lake has run.
 	sql := "SELECT snapshot_id, snapshot_time, schema_version FROM _lake.snapshots() ORDER BY snapshot_id DESC LIMIT 5;"
-	script := c.attachPrefix() + sql
-	cmd := exec.CommandContext(ctx, c.cliPath, "-json", "-c", script)
+	cmd := exec.CommandContext(ctx, c.cliPath, c.cliArgs(sql, "-json")...)
 	out, err := cmd.Output()
 	if err != nil {
 		// Report the failure. This used to substitute a synthetic "lake" row,
@@ -950,14 +991,7 @@ func (c *QuackClient) FetchCatalogCmd() tea.Cmd {
 			     WHERE database_name = current_database() AND NOT internal
 			    ORDER BY table_schema, table_name;`
 
-		var args []string
-		if c.Config.Type == ConnLocal {
-			args = []string{c.Config.Path, "-json", "-c", sql}
-		} else {
-			args = []string{"-json", "-c", c.attachPrefix() + sql}
-		}
-
-		cmd := exec.CommandContext(ctx, c.cliPath, args...)
+		cmd := exec.CommandContext(ctx, c.cliPath, c.cliArgs(sql, "-json")...)
 		out, err := cmd.Output()
 		if err != nil {
 			// stderr carries the Binder/Catalog error; "exit status 1" alone
@@ -1018,6 +1052,7 @@ func parseCatalogRows(data []byte) ([]CatalogSchema, error) {
 type configFile struct {
 	Servers        []ServerConfig  `json:"servers"`
 	StorageSecrets []StorageSecret `json:"storage_secrets,omitempty"`
+	Tokens         []Token         `json:"tokens,omitempty"`
 }
 
 // ConfigFilePath returns the on-disk location of the persisted config.
@@ -1029,15 +1064,27 @@ func ConfigFilePath() string {
 	return filepath.Join(home, ".duckdb", "pintail.json")
 }
 
+// loadConfigFile reads and decodes the whole config file. A missing or
+// unparseable file yields an empty struct — every Load* helper below layers its
+// own defaults on top, and every Save* helper reads the current file first so
+// that writing one section cannot drop another.
+func loadConfigFile() configFile {
+	var f configFile
+	data, err := os.ReadFile(ConfigFilePath())
+	if err != nil {
+		return f
+	}
+	if err := json.Unmarshal(data, &f); err != nil {
+		return configFile{}
+	}
+	return f
+}
+
 // LoadServerConfigs reads persisted server configs; returns defaults if none.
 // Backfills Type=ConnQuack on legacy configs that pre-date the type field.
 func LoadServerConfigs() []ServerConfig {
-	data, err := os.ReadFile(ConfigFilePath())
-	if err != nil {
-		return defaultConfigs()
-	}
-	var f configFile
-	if err := json.Unmarshal(data, &f); err != nil || len(f.Servers) == 0 {
+	f := loadConfigFile()
+	if len(f.Servers) == 0 {
 		return defaultConfigs()
 	}
 	for i := range f.Servers {
@@ -1051,39 +1098,72 @@ func LoadServerConfigs() []ServerConfig {
 // LoadStorageSecrets reads persisted storage secrets from the same config file.
 // Returns nil if the file or section is missing.
 func LoadStorageSecrets() []StorageSecret {
-	data, err := os.ReadFile(ConfigFilePath())
-	if err != nil {
-		return nil
-	}
-	var f configFile
-	if err := json.Unmarshal(data, &f); err != nil {
-		return nil
-	}
-	return f.StorageSecrets
+	return loadConfigFile().StorageSecrets
 }
 
-// SaveServerConfigs persists server configs to ~/.duckdb/pintail.json,
-// preserving any existing storage secrets.
+// LoadTokens reads persisted Quack tokens. Tokens live in the same file as the
+// storage secrets and carry the same plaintext caveat; the file is written
+// 0600 and its directory 0700 because both sections are credentials.
+func LoadTokens() []Token {
+	return loadConfigFile().Tokens
+}
+
+// SaveServerConfigs persists server configs, preserving the other sections.
 func SaveServerConfigs(cfgs []ServerConfig) error {
-	secrets := LoadStorageSecrets()
-	return saveConfigFile(cfgs, secrets)
+	f := loadConfigFile()
+	f.Servers = cfgs
+	return saveConfigFile(f)
 }
 
-// SaveStorageSecrets persists secrets to the same config file, preserving servers.
+// SaveStorageSecrets persists secrets, preserving the other sections.
 func SaveStorageSecrets(secrets []StorageSecret) error {
-	cfgs := LoadServerConfigs()
-	return saveConfigFile(cfgs, secrets)
+	f := loadConfigFile()
+	f.StorageSecrets = secrets
+	return saveConfigFile(f)
 }
 
-func saveConfigFile(cfgs []ServerConfig, secrets []StorageSecret) error {
-	if err := os.MkdirAll(filepath.Dir(ConfigFilePath()), 0750); err != nil {
+// SaveTokens persists Quack tokens, preserving the other sections. Without
+// this, a token created or rotated in the token manager existed only in memory
+// and was destroyed on quit — taking the only copy of a rotated value with it.
+func SaveTokens(tokens []Token) error {
+	f := loadConfigFile()
+	f.Tokens = tokens
+	return saveConfigFile(f)
+}
+
+// saveConfigFile writes the config atomically: a temp file in the same
+// directory, then a rename. A crash partway through a direct write left the
+// file truncated, which read back as "no connections configured".
+func saveConfigFile(f configFile) error {
+	path := ConfigFilePath()
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(configFile{Servers: cfgs, StorageSecrets: secrets}, "", "  ")
+	data, err := json.MarshalIndent(f, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(ConfigFilePath(), data, 0640)
+
+	tmp, err := os.CreateTemp(dir, ".pintail-*.json")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op once the rename succeeds
+
+	if err := tmp.Chmod(0600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 // InitClients builds a QuackClient for every server config. The resolvers

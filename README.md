@@ -200,7 +200,7 @@ query routing, and metadata fetch accordingly.
 | Type       | Use it for                          | Reachability                     | Query routing                                                                                                          |
 |------------|-------------------------------------|----------------------------------|------------------------------------------------------------------------------------------------------------------------|
 | `quack`    | Remote DuckDB via Quack             | TCP `host:port`                  | `ATTACH 'quack://…' AS _remote (TOKEN '…'); USE _remote;`                                                              |
-| `local`    | Plain `.duckdb` file on disk        | `os.Stat(path)`                  | `duckdb <path> -json -c "<sql>"` (file opened directly via argv)                                                       |
+| `local`    | Plain `.duckdb` file on disk        | `os.Stat(path)`                  | `duckdb <path> -json -c "<sql>"` (file opened directly via argv; a `storage_secret_ref` is prepended as `CREATE SECRET`) |
 | `ducklake` | DuckLake lakehouse                  | TCP dial of catalog host / stat  | `INSTALL ducklake; LOAD ducklake; ATTACH 'ducklake:…' AS _lake (DATA_PATH '…'); USE _lake;`                            |
 
 ### DuckLake catalog via another connection (multi-writer pattern)
@@ -251,6 +251,12 @@ The secrets screen (`t`) has two modes — `tab` toggles between them:
 
 Storage secrets are needed whenever DuckDB has to reach over the network to read data — almost always for `ducklake` connections (the `storage_path` is usually remote), and optionally for `local` connections when the database file path is itself a URI (`s3://bucket/db.duckdb`) or queries reach remote Parquet. `quack` connections don't use them; the Quack server has its own credentials.
 
+A `local` connection whose path is a URI is attached read-only after the
+secret is created (`ATTACH 's3://…' AS _local (READ_ONLY)`), since the
+credential has to exist before the database can be opened. Such paths can't be
+stat'd, so they are shown as `◍ remote path · not probed` rather than pinged —
+the first query reports any real problem with the path or credentials.
+
 A connection references a storage secret by name:
 
 ```json
@@ -275,7 +281,7 @@ USE _lake;
 -- your query
 ```
 
-Secrets are stored in plaintext under `storage_secrets` in `~/.duckdb/pintail.json` — file permissions are your responsibility. For real key management, paste values from Vault / 1Password / your secret store; Pintail doesn't try to be one.
+Secrets are stored in plaintext under `storage_secrets` in `~/.duckdb/pintail.json`, and Quack tokens under `tokens` in the same file. Pintail writes it `0600` inside a `0700` directory; beyond that, file permissions are your responsibility. For real key management, paste values from Vault / 1Password / your secret store; Pintail doesn't try to be one.
 
 ### DuckLake snapshots
 
@@ -363,11 +369,21 @@ For live queries, also install the DuckDB CLI: `duckdb` needs to be on
   ],
   "storage_secrets": [
     { "name": "lake_s3", "type": "s3", "key_id": "AKIA…", "secret": "…", "region": "us-east-1", "scope": "s3://datalake-prod/lake" }
+  ],
+  "tokens": [
+    { "name": "etl_pipeline_prod", "value": "qk_…", "scope": ["analytics"], "permissions": ["SELECT"], "active": true }
   ]
 }
 ```
 
-Legacy configs without a `type` field default to `quack` for back-compat.
+Legacy configs without a `type` field default to `quack` for back-compat, and
+a file without a `tokens` or `storage_secrets` section loads fine — each
+section is written independently and the others are preserved.
+
+The file is written atomically (temp file + rename) with mode `0600`, and its
+directory `0700`: it holds bearer tokens and cloud credentials in plaintext.
+Saving one section re-reads the file first, so a token edit cannot drop a
+connection you added in the meantime.
 
 Other files written under `~/.duckdb/`:
 

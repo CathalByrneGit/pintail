@@ -345,7 +345,7 @@ func NewModel() Model {
 		tokenMgr:       NewTokenManager(),
 		scratchpad:     NewScratchpad(servers, clients),
 		tlsGen:         NewTLSGenerator(configs),
-		authEditor:     NewAuthEditor(mockTokens(), clients),
+		authEditor:     NewAuthEditor(LoadTokens(), clients),
 		snapshots:      NewSnapshotsView(clients),
 	}
 	m.connTable = buildConnectionTable(mockConnections)
@@ -898,6 +898,11 @@ func (m Model) viewHeader() string {
 		if state.PingedAt.IsZero() {
 			dot = mutedStyle.Render("◌")
 			statusDetail = mutedStyle.Render(" pinging…")
+		} else if state.Online && state.Method == "uri" {
+			// Reachability was never actually checked for this one — say so
+			// rather than showing a green dot we haven't earned.
+			dot = amberStyle.Render("◍")
+			statusDetail = mutedStyle.Render(" remote path · not probed")
 		} else if state.Online {
 			dot = greenStyle.Render("●")
 			statusDetail = greenStyle.Render(fmt.Sprintf(" %dms", state.Latency.Milliseconds()))

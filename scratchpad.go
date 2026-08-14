@@ -699,18 +699,12 @@ func exportParquet(c *QuackClient, sql string) (string, error) {
 
 	// Strip trailing semicolons; the inner SQL goes inside COPY (...) TO.
 	inner := strings.TrimRight(strings.TrimSpace(sql), ";")
-	copySQL := fmt.Sprintf("COPY (%s) TO '%s' (FORMAT PARQUET);", inner, path)
+	copySQL := fmt.Sprintf("COPY (%s) TO '%s' (FORMAT PARQUET);", inner, sqlQuote(path))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	var args []string
-	if c.Config.Type == ConnLocal {
-		args = []string{c.Config.Path, "-c", copySQL}
-	} else {
-		args = []string{"-c", c.attachPrefix() + copySQL}
-	}
-	cmd := exec.CommandContext(ctx, c.cliPath, args...)
+	cmd := exec.CommandContext(ctx, c.cliPath, c.cliArgs(copySQL)...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return "", fmt.Errorf("%s", strings.TrimSpace(string(out)))
 	}

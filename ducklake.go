@@ -304,9 +304,7 @@ func fetchSnapshots(ctx context.Context, c *QuackClient) ([]Snapshot, error) {
 	// default schema; it expands to ducklake_snapshots('_lake'), so both
 	// spellings are valid once attachPrefix() has run ATTACH ... AS _lake.
 	sql := "SELECT * FROM _lake.snapshots() ORDER BY snapshot_id DESC LIMIT 50;"
-	script := c.attachPrefix() + sql
-
-	cmd := exec.CommandContext(ctx, c.cliPath, "-json", "-c", script)
+	cmd := exec.CommandContext(ctx, c.cliPath, c.cliArgs(sql, "-json")...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("snapshot query failed: %s", strings.TrimSpace(string(out)))
