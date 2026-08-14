@@ -326,10 +326,10 @@ func (tm TokenManager) ViewTokenList(width, height int) string {
 			}
 		}
 
-		scopeStr := strings.Join(t.Scope, ", ")
-		if len(scopeStr) > width-18 {
-			scopeStr = scopeStr[:width-21] + "…"
-		}
+		// Room left for the scope line after the cursor, dot and padding.
+		// On a narrow terminal this goes negative — truncate handles that by
+		// dropping the scope rather than slicing past the start of the string.
+		scopeStr := truncate(strings.Join(t.Scope, ", "), width-18)
 
 		line := cursor + dot + " " + style.Render(t.Name) +
 			"\n    " + mutedStyle.Render(scopeStr)
@@ -344,7 +344,7 @@ func (tm TokenManager) ViewTokenList(width, height int) string {
 		}
 	}
 	lines = append(lines, "")
-	lines = append(lines, mutedStyle.Render(strings.Repeat("─", width-6)))
+	lines = append(lines, mutedStyle.Render(hrule(width-6)))
 	lines = append(lines,
 		mutedStyle.Render("active   ")+greenStyle.Render(fmt.Sprintf("%d", active)),
 		mutedStyle.Render("revoked  ")+redStyle.Render(fmt.Sprintf("%d", len(tm.tokens)-active)),
@@ -390,8 +390,9 @@ func (tm TokenManager) ViewTokenDetail(width int) string {
 		"",
 	)
 
-	// Generated SQL block
-	sql := tokenSQL(*t)
+	// Generated SQL block — the value is elided here unless [v] is toggled,
+	// matching the masking of the Token row above.
+	sql := tokenSQL(*t, tm.showValue)
 	lines = append(lines,
 		labelStyle.Render("SQL to apply"),
 		renderCodeBlock(sql, width-4),
@@ -556,11 +557,18 @@ func generateID() string {
 	return hex.EncodeToString(b)
 }
 
-func tokenSQL(t Token) string {
+// tokenSQL renders the CREATE SECRET statement for a token.
+//
+// `full` decides whether the token value is written verbatim. Exports must be
+// runnable, so they pass true; the on-screen block passes the reveal state, so
+// the value stays elided until the operator asks for it with [v]. Rendering
+// the elided form into the export file made every exported credential
+// unusable — the reason this parameter exists rather than being a constant.
+func tokenSQL(t Token, full bool) string {
 	scope := strings.Join(t.Scope, ", ")
 	val := t.Value
-	if len(val) > 16 {
-		val = val[:16] + "…"
+	if !full {
+		val = truncate(val, 16)
 	}
 	perms := strings.Join(t.Permissions, " | ")
 	var sb strings.Builder
@@ -589,7 +597,7 @@ func exportTokenSQL(t Token) (string, error) {
 	defer f.Close()
 
 	fmt.Fprintf(f, "-- Token: %s  exported: %s\n", t.Name, time.Now().Format(time.RFC3339))
-	fmt.Fprintln(f, tokenSQL(t))
+	fmt.Fprintln(f, tokenSQL(t, true))
 	fmt.Fprintln(f)
 	return path, nil
 }

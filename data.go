@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -72,4 +73,34 @@ var mockCatalog []CatalogSchema = nil
 // session fetch returned, and nothing else.
 func refreshConnections(conns []Connection) []Connection {
 	return conns
+}
+
+// ── width-safe helpers ────────────────────────────────────────────────────
+//
+// Panel widths are derived from the terminal size (leftW = width*30/100 and
+// friends), so on a narrow terminal the "width - padding" arithmetic every
+// view does can land below zero. strings.Repeat panics on a negative count
+// and s[:negative] panics too, which took the whole TUI down. These two
+// helpers absorb that.
+
+// hrule renders a horizontal rule n cells wide, clamping to empty rather
+// than panicking when the caller's width arithmetic goes negative.
+func hrule(n int) string {
+	if n < 1 {
+		return ""
+	}
+	return strings.Repeat("─", n)
+}
+
+// cutRunes returns at most the first n runes of s. Unlike s[:n] it never
+// panics on a short string and never slices mid-codepoint.
+func cutRunes(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n])
 }

@@ -654,8 +654,7 @@ func (m Model) updateAddServer(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				for i, c := range m.configs {
 					servers[i] = c.ToServerInfo()
 				}
-				m.scratchpad.servers = servers
-				m.scratchpad.clients = m.clients
+				m.scratchpad.SetTargets(servers, m.clients)
 				SaveServerConfigs(m.configs)
 				if f.listCursor >= len(m.configs) && f.listCursor > 0 {
 					f.listCursor--
@@ -783,8 +782,7 @@ func (m Model) updateAddServer(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		for i, c := range m.configs {
 			servers[i] = c.ToServerInfo()
 		}
-		m.scratchpad.servers = servers
-		m.scratchpad.clients = m.clients
+		m.scratchpad.SetTargets(servers, m.clients)
 
 		SaveServerConfigs(m.configs)
 		savedIdx := len(m.clients) - 1

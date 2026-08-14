@@ -199,7 +199,7 @@ func (g TLSGenerator) ViewForm(width int) string {
 	}
 
 	// Proxy selector
-	lines = append(lines, mutedStyle.Render(strings.Repeat("─", width-6)), "")
+	lines = append(lines, mutedStyle.Render(hrule(width-6)), "")
 	lines = append(lines, labelStyle.Render("PROXY TYPE")+"  "+mutedStyle.Render("[tab] to cycle"))
 	lines = append(lines, "")
 

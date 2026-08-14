@@ -561,35 +561,61 @@ func (c *QuackClient) QueryAsync(sql string, fallbackSrv ServerInfo) tea.Cmd {
 		state := c.GetState()
 		start := time.Now()
 
-		if state.Online && c.hasCLI {
-			if r, err := c.queryCLI(ctx, sql); err == nil {
-				r.ElapsedMs = int(time.Since(start).Milliseconds())
-				r.Method = "cli"
-				return queryResultMsg{result: r}
-			}
+		if !state.Online {
+			// Offline — surface a clear error rather than fabricating data.
+			// mockExecute is now a stub that returns an "offline / see README" Err.
+			r := mockExecute(sql, fallbackSrv)
+			r.ElapsedMs = int(time.Since(start).Milliseconds())
+			r.Method = "offline"
+			return queryResultMsg{result: &r, isMock: false}
 		}
 
-		if state.Online {
-			if r, err := c.queryHTTP(ctx, sql); err == nil {
-				r.ElapsedMs = int(time.Since(start).Milliseconds())
-				r.Method = "http"
-				return queryResultMsg{result: r}
-			} else {
-				return queryResultMsg{result: &QueryResult{
-					Query:     sql,
-					Err:       fmt.Sprintf("server reachable but query failed: %v", err),
-					Timestamp: time.Now(),
-					Method:    "http",
-				}}
-			}
+		done := func(r *QueryResult, method string) tea.Msg {
+			r.ElapsedMs = int(time.Since(start).Milliseconds())
+			r.Method = method
+			return queryResultMsg{result: r}
+		}
+		fail := func(method, msg string) tea.Msg {
+			return queryResultMsg{result: &QueryResult{
+				Query:     sql,
+				Err:       msg,
+				Timestamp: time.Now(),
+				ElapsedMs: int(time.Since(start).Milliseconds()),
+				Method:    method,
+			}}
 		}
 
-		// Offline — surface a clear error rather than fabricating data.
-		// mockExecute is now a stub that returns an "offline / see README" Err.
-		r := mockExecute(sql, fallbackSrv)
-		r.ElapsedMs = int(time.Since(start).Milliseconds())
-		r.Method = "offline"
-		return queryResultMsg{result: &r, isMock: false}
+		// Only Quack remotes have a host:port to POST to. For local files and
+		// DuckLake the CLI is the one and only path, so a CLI failure IS the
+		// answer: falling through to HTTP dialed http://:0 and replaced the
+		// real DuckDB error with "no endpoint responded", which is what the
+		// user then had to debug.
+		overHTTP := c.Config.Type == ConnQuack
+
+		var errs []string
+		method := "cli"
+
+		if c.hasCLI {
+			r, err := c.queryCLI(ctx, sql)
+			if err == nil {
+				return done(r, "cli")
+			}
+			errs = append(errs, err.Error())
+		} else if !overHTTP {
+			return fail("cli", fmt.Sprintf(
+				"duckdb CLI not found in PATH — required for %s connections", c.Config.Type))
+		}
+
+		if overHTTP {
+			method = "http"
+			r, err := c.queryHTTP(ctx, sql)
+			if err == nil {
+				return done(r, "http")
+			}
+			errs = append(errs, err.Error())
+		}
+
+		return fail(method, strings.Join(errs, "; "))
 	}
 }
 
@@ -806,18 +832,22 @@ func parseSessionRows(data []byte, cfg ServerConfig) ([]Connection, error) {
 
 	conns := make([]Connection, 0, len(rows))
 	for i, row := range rows {
+		// Both of these are cut to the dashboard column width. cutRunes is
+		// used rather than a byte slice: connection_id is frequently a small
+		// integer (shorter than the column), and client_context is free-form
+		// text that may be multibyte.
 		id := fmt.Sprintf("c%02d", i+1)
 		if v, ok := row["connection_id"]; ok {
-			id = fmt.Sprintf("%v", v)[:4]
+			if s := cutRunes(fmt.Sprintf("%v", v), 4); s != "" {
+				id = s
+			}
 		}
 
 		identity := cfg.Name
 		if v, ok := row["client_context"]; ok {
-			s := fmt.Sprintf("%v", v)
-			if len(s) > 16 {
-				s = s[:16]
+			if s := cutRunes(fmt.Sprintf("%v", v), 16); s != "" {
+				identity = s
 			}
-			identity = s
 		}
 
 		since := time.Duration(0)

@@ -209,7 +209,7 @@ func (v SnapshotsView) ViewDetail(width int) string {
 	if c != nil {
 		lines = append(lines,
 			"",
-			mutedStyle.Render(strings.Repeat("─", width-4)),
+			mutedStyle.Render(hrule(width-4)),
 			"",
 			labelStyle.Render("TIME-TRAVEL READ"),
 			"",

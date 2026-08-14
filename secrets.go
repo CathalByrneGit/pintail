@@ -372,7 +372,7 @@ func (tm TokenManager) ViewSecretDetail(width int) string {
 
 	rows = append(rows,
 		"",
-		mutedStyle.Render(strings.Repeat("─", width-4)),
+		mutedStyle.Render(hrule(width-4)),
 		"",
 		labelStyle.Render("SQL"),
 		"",

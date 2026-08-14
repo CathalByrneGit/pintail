@@ -101,6 +101,31 @@ func NewScratchpad(servers []ServerInfo, clients []*QuackClient) Scratchpad {
 	}
 }
 
+// SetTargets replaces the list of connections the scratchpad can target,
+// keeping serverIdx inside the new bounds. Deleting connections in the
+// connection manager used to leave the index dangling past the end of the
+// shorter slice, panicking on the next render of this screen.
+func (sp *Scratchpad) SetTargets(servers []ServerInfo, clients []*QuackClient) {
+	sp.servers = servers
+	sp.clients = clients
+	if sp.serverIdx >= len(servers) {
+		sp.serverIdx = len(servers) - 1
+	}
+	if sp.serverIdx < 0 {
+		sp.serverIdx = 0
+	}
+}
+
+// target returns the currently-selected server. The second return is false
+// when there is nothing to target — no connections configured, or an index
+// that outlived the slice it pointed into.
+func (sp Scratchpad) target() (ServerInfo, bool) {
+	if sp.serverIdx < 0 || sp.serverIdx >= len(sp.servers) {
+		return ServerInfo{}, false
+	}
+	return sp.servers[sp.serverIdx], true
+}
+
 // Resize updates internal component sizes to match the terminal.
 func (sp *Scratchpad) Resize(w, h int) {
 	sp.width = w
@@ -270,9 +295,19 @@ func (sp Scratchpad) runQuery() (Scratchpad, tea.Cmd) {
 		return sp, nil
 	}
 
-	sp.running = true
+	srv, ok := sp.target()
+	if !ok {
+		return sp, func() tea.Msg {
+			return queryResultMsg{result: &QueryResult{
+				Query:     sql,
+				Err:       "no connection configured — add one from the dashboard with [a]",
+				Timestamp: time.Now(),
+				Method:    "offline",
+			}}
+		}
+	}
 
-	srv := sp.servers[sp.serverIdx]
+	sp.running = true
 
 	// Resolve the right client for the selected server
 	var client *QuackClient
@@ -323,7 +358,16 @@ func (sp Scratchpad) historyNext() Scratchpad {
 // ── View helpers ──────────────────────────────────────────────────────────
 
 func (sp Scratchpad) ViewEditor() string {
-	srv := sp.servers[sp.serverIdx]
+	srv, ok := sp.target()
+	if !ok {
+		return lipgloss.JoinVertical(lipgloss.Left,
+			"  "+mutedStyle.Render("target  ")+
+				redStyle.Render("none")+
+				mutedStyle.Render("  add a connection from the dashboard with [a]"),
+			"",
+			sp.editor.View(),
+		)
+	}
 	scheme := "quack://"
 	badge := amberStyle.Render("● HTTP")
 	if srv.TLS {
@@ -570,14 +614,26 @@ func padRight(s string, w int) string {
 	return s + strings.Repeat(" ", w-len(s))
 }
 
+// truncate shortens s to at most n characters, marking the cut with an
+// ellipsis when there's room for one. n <= 0 means "no room at all" and
+// yields the empty string — callers derive n from panel widths, which go
+// negative on narrow terminals, and returning the untruncated string there
+// blew the layout apart.
+//
+// Cuts land on rune boundaries; slicing bytes used to emit invalid UTF-8 for
+// multibyte content (query results, client_context, snapshot fields).
 func truncate(s string, n int) string {
-	if n <= 0 || len(s) <= n {
+	if n <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= n {
 		return s
 	}
 	if n <= 3 {
-		return s[:n]
+		return string(r[:n])
 	}
-	return s[:n-1] + "…"
+	return string(r[:n-1]) + "…"
 }
 
 func firstLine(s string) string {

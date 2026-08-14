@@ -226,7 +226,7 @@ func (a AuthEditor) ViewPermGrid(width int) string {
 
 	lines = append(lines, "")
 	lines = append(lines,
-		mutedStyle.Render(strings.Repeat("─", width-6)),
+		mutedStyle.Render(hrule(width-6)),
 		"",
 		labelStyle.Render("GENERATED SQL"),
 		"",
