@@ -329,8 +329,8 @@ func (c ServerConfig) AttachPrefix(resolve ConfigResolver, resolveSecret SecretR
 		}
 	case ConnQuack:
 		b.WriteString(fmt.Sprintf(
-			"ATTACH '%s' AS _remote (TOKEN '%s'); USE _remote; ",
-			c.QuackURI(), sqlQuote(c.Token),
+			"ATTACH '%s' AS _remote (%s); USE _remote; ",
+			c.QuackURI(), strings.Join(c.quackAttachOptions(), ", "),
 		))
 	case ConnDuckLake:
 		if c.CatalogRef != "" && resolve != nil {
@@ -351,14 +351,41 @@ func (c ServerConfig) AttachPrefix(resolve ConfigResolver, resolveSecret SecretR
 	return b.String()
 }
 
+// quackAttachOptions renders the option list for an ATTACH against a Quack
+// server: the bearer token, and an explicit DISABLE_SSL.
+//
+// The explicit DISABLE_SSL matters. The quack extension defaults SSL *on* for
+// any host that isn't localhost/127.0.0.1/::1, so a plaintext server on a real
+// hostname — the common case behind a TLS-terminating proxy on another port, or
+// on a private network — was being reached over https:// and failing, with the
+// connection's own TLS setting only ever used to pick a badge colour. Passing
+// the flag either way makes that setting mean what it says.
+func (c ServerConfig) quackAttachOptions() []string {
+	opts := []string{fmt.Sprintf("TOKEN '%s'", sqlQuote(c.Token))}
+	if c.TLS {
+		return append(opts, "DISABLE_SSL false")
+	}
+	return append(opts, "DISABLE_SSL true")
+}
+
+// quackQueryOptions renders the named parameters for quack_query(), which take
+// `name = value` form rather than the bare option list ATTACH uses.
+func (c ServerConfig) quackQueryOptions() []string {
+	opts := []string{fmt.Sprintf("token = '%s'", sqlQuote(c.Token))}
+	if c.TLS {
+		return append(opts, "disable_ssl = false")
+	}
+	return append(opts, "disable_ssl = true")
+}
+
 // buildCatalogAttach renders just the ATTACH ... AS _catalog statement for a
 // referenced config. Handles Quack (with token), local file, and freeform URLs.
 func buildCatalogAttach(catCfg ServerConfig) string {
 	switch catCfg.Type {
 	case ConnQuack:
 		return fmt.Sprintf(
-			"ATTACH '%s' AS _catalog (TOKEN '%s'); ",
-			catCfg.QuackURI(), sqlQuote(catCfg.Token),
+			"ATTACH '%s' AS _catalog (%s); ",
+			catCfg.QuackURI(), strings.Join(catCfg.quackAttachOptions(), ", "),
 		)
 	case ConnLocal:
 		return fmt.Sprintf("ATTACH '%s' AS _catalog; ", sqlQuote(catCfg.Path))
@@ -487,26 +514,35 @@ func (c *QuackClient) Ping(ctx context.Context) (time.Duration, error) {
 	case ConnDuckLake:
 		return c.pingDuckLake(ctx)
 	default: // ConnQuack
-		return c.pingTCP(ctx)
+		return c.pingQuack(ctx)
 	}
 }
 
-// pingTCP dials host:port for a Quack remote.
-func (c *QuackClient) pingTCP(ctx context.Context) (time.Duration, error) {
+// pingQuack checks a Quack remote with an HTTP GET on its banner endpoint.
+//
+// This is a strictly better check than the TCP dial it replaces: a dial only
+// proves something holds the port, while the banner proves it is a Quack server
+// — and going over HTTP means the connection's TLS setting is finally exercised
+// by the health check rather than only tinting a badge. Method records which of
+// the two we got, so the header can distinguish a confirmed Quack endpoint from
+// "something answered".
+func (c *QuackClient) pingQuack(ctx context.Context) (time.Duration, error) {
 	start := time.Now()
-	dialer := &net.Dialer{}
-	conn, err := dialer.DialContext(ctx, "tcp", c.Config.Addr())
+	confirmed, err := c.probeQuackHTTP(ctx)
 	latency := time.Since(start)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if err != nil {
-		c.state = ConnState{Online: false, ErrMsg: simplifyNetErr(err), PingedAt: time.Now(), Method: "tcp"}
+		c.state = ConnState{Online: false, ErrMsg: simplifyNetErr(err), PingedAt: time.Now(), Method: "http"}
 		return 0, err
 	}
-	conn.Close()
-	c.state = ConnState{Online: true, Latency: latency, PingedAt: time.Now(), Method: "tcp"}
+	method := "http"
+	if confirmed {
+		method = "quack"
+	}
+	c.state = ConnState{Online: true, Latency: latency, PingedAt: time.Now(), Method: method}
 	return latency, nil
 }
 
@@ -655,44 +691,26 @@ func (c *QuackClient) Query(ctx context.Context, sql string) *QueryResult {
 		}
 	}
 
-	// Only Quack remotes have a host:port to POST to. For local files and
-	// DuckLake the CLI is the one and only path, so a CLI failure IS the
-	// answer: falling through to HTTP dialed http://:0 and replaced the
-	// real DuckDB error with "no endpoint responded", which is what the
-	// user then had to debug.
-	overHTTP := c.Config.Type == ConnQuack
-
-	var errs []string
-	method := "cli"
-
-	if c.hasCLI {
-		r, err := c.queryCLI(ctx, sql)
-		if err == nil {
-			return done(r, "cli")
-		}
-		// A cancelled or timed-out query is not a SQL failure; say which.
-		if ctxErr := ctxReason(ctx); ctxErr != "" {
-			return fail("cli", ctxErr)
-		}
-		errs = append(errs, err.Error())
-	} else if !overHTTP {
+	// The CLI is the only way to run a query, for every backend including
+	// Quack: the Quack wire protocol is a binary application/vnd.duckdb message
+	// on POST /quack, which is DuckDB's job to speak, not ours. Pintail used to
+	// fall back to POSTing JSON at invented endpoints, which no Quack server has
+	// ever served — and the resulting "no endpoint responded" replaced whatever
+	// the real failure was.
+	if !c.hasCLI {
 		return fail("cli", fmt.Sprintf(
 			"duckdb CLI not found in PATH — required for %s connections", c.Config.Type))
 	}
 
-	if overHTTP {
-		method = "http"
-		r, err := c.queryHTTP(ctx, sql)
-		if err == nil {
-			return done(r, "http")
-		}
-		if ctxErr := ctxReason(ctx); ctxErr != "" {
-			return fail("http", ctxErr)
-		}
-		errs = append(errs, err.Error())
+	r, err := c.queryCLI(ctx, sql)
+	if err == nil {
+		return done(r, "cli")
 	}
-
-	return fail(method, strings.Join(errs, "; "))
+	// A cancelled or timed-out query is not a SQL failure; say which.
+	if ctxErr := ctxReason(ctx); ctxErr != "" {
+		return fail("cli", ctxErr)
+	}
+	return fail("cli", err.Error())
 }
 
 // ctxReason turns a finished context into the reason a query stopped, or ""
@@ -737,42 +755,37 @@ func (c *QuackClient) queryCLI(ctx context.Context, sql string) (*QueryResult, e
 	return parseJSONRows(sql, out)
 }
 
-// queryHTTP tries a JSON POST to common Quack HTTP endpoint patterns.
-func (c *QuackClient) queryHTTP(ctx context.Context, sql string) (*QueryResult, error) {
-	body, _ := json.Marshal(map[string]string{"query": sql, "sql": sql})
-
-	for _, ep := range []string{"/query", "/", "/v1/query"} {
-		req, err := http.NewRequestWithContext(ctx, "POST",
-			c.Config.BaseURL()+ep, bytes.NewReader(body))
-		if err != nil {
-			continue
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Accept", "application/json")
-		if c.Config.Token != "" {
-			req.Header.Set("Authorization", "Bearer "+c.Config.Token)
-		}
-
-		resp, err := c.http.Do(req)
-		if err != nil {
-			continue
-		}
-
-		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-			resp.Body.Close()
-			return nil, fmt.Errorf("auth failed (HTTP %d) — check token", resp.StatusCode)
-		}
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			data, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-			resp.Body.Close()
-			if err != nil {
-				return nil, err
-			}
-			return parseJSONRows(sql, data)
-		}
-		resp.Body.Close()
+// probeQuackHTTP checks that something is answering HTTP where a Quack server
+// should be, and reports whether it identified itself as one.
+//
+// This replaced a query path that could never have worked: Pintail used to POST
+// JSON to /query, / and /v1/query. A Quack server serves exactly two things —
+// GET / (a plain-text banner) and POST /quack (a binary application/vnd.duckdb
+// RPC message) — so all three attempts 404'd, and the resulting "no endpoint
+// responded" replaced whatever the real failure had been. The banner is worth
+// keeping, though: it distinguishes a Quack server from any other process that
+// happens to hold the port, which a bare TCP dial cannot.
+//
+// Any HTTP answer counts as reachable. A reverse proxy may well refuse GET /
+// (the Caddyfile Pintail itself generates returns 401 to unauthenticated
+// requests), and that is a working deployment, not an offline one.
+func (c *QuackClient) probeQuackHTTP(ctx context.Context) (confirmed bool, err error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", c.Config.BaseURL()+"/", nil)
+	if err != nil {
+		return false, err
 	}
-	return nil, fmt.Errorf("no endpoint responded (tried /query, /, /v1/query)")
+	if c.Config.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.Config.Token)
+	}
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+	return strings.Contains(string(body), "Quack RPC endpoint"), nil
 }
 
 // parseJSONRows converts DuckDB's -json output (array of objects) to QueryResult.
@@ -857,24 +870,29 @@ func (c *QuackClient) FetchSessionsCmd(idx int) tea.Cmd {
 	}
 }
 
-// fetchQuackSessions reports what the session is able to know about itself.
+// fetchQuackSessions lists the sessions a Quack server is actually serving.
 //
-// This used to query duckdb_connections(), which does not exist in DuckDB —
-// the call failed with a Catalog Error on every poll, and the dropped error
-// left the panel looking merely empty. DuckDB exposes no per-connection
-// listing: current_connection_id(), session_user() and duckdb_connection_count()
-// are the whole surface, and metadata functions evaluate wherever the query
-// runs. So one row is reported — ours — with the backend's connection count
-// alongside it, rather than a fabricated list of peers.
+// The quack extension exposes quack_active_connections() — server_id,
+// connection_id, query, state, query_started_at — but it reports on whichever
+// process evaluates it, so calling it through our own attached connection would
+// only ever describe us. quack_query() hands SQL to the server to run there,
+// which is what makes the real list reachable from a client.
 //
-// If a Quack server grows a real session-listing function, that is the right
-// source for this panel and this query should be replaced by it.
+// Two earlier versions of this query were wrong: duckdb_connections(), which
+// does not exist in DuckDB at all, and then a self-report built from
+// current_connection_id() and duckdb_connection_count() — honest about what it
+// was, but describing the wrong process.
 func (c *QuackClient) fetchQuackSessions(ctx context.Context, idx int) tea.Msg {
-	sql := `SELECT current_connection_id() AS connection_id,
-	               session_user()          AS client_context,
-	               current_database()      AS catalog,
-	               (SELECT count FROM duckdb_connection_count()) AS connection_count;`
-	cmd := exec.CommandContext(ctx, c.cliPath, c.cliArgs(sql, "-json")...)
+	sql := fmt.Sprintf(
+		"INSTALL quack; LOAD quack; SELECT * FROM quack_query('%s', '%s', %s);",
+		sqlQuote(c.Config.QuackURI()),
+		sqlQuote("FROM quack_active_connections()"),
+		strings.Join(c.Config.quackQueryOptions(), ", "),
+	)
+
+	// Deliberately not via cliArgs: quack_query connects to the server itself,
+	// so this must not be preceded by the ATTACH prologue.
+	cmd := exec.CommandContext(ctx, c.cliPath, "-json", "-c", sql)
 	out, err := cmd.Output()
 	if err != nil {
 		return sessionResultMsg{idx: idx, err: fmt.Errorf("session query: %s", cliError(err))}
@@ -941,9 +959,12 @@ func parseDuckLakeSnapshots(data []byte, cfg ServerConfig) ([]Connection, error)
 	return conns, nil
 }
 
-// parseSessionRows converts the session-facts JSON into []Connection. The
-// second return is the connection count the backend reported, verbatim and
-// possibly empty — the panel labels it rather than inventing a row per peer.
+// parseSessionRows converts quack_active_connections() rows into []Connection.
+//
+// Columns come from the quack extension: server_id, connection_id, query, state
+// and query_started_at. Older field names (client_context, connected_since,
+// catalog) are still honoured so a backend that reports them keeps working; the
+// second return carries a connection_count if one is present.
 func parseSessionRows(data []byte, cfg ServerConfig) ([]Connection, string, error) {
 	data = bytes.TrimSpace(data)
 	if len(data) == 0 || string(data) == "[]" {
@@ -955,43 +976,60 @@ func parseSessionRows(data []byte, cfg ServerConfig) ([]Connection, string, erro
 		return nil, "", fmt.Errorf("parse error")
 	}
 
+	// field returns the first present, non-null value among the given keys.
+	field := func(row map[string]interface{}, keys ...string) string {
+		for _, k := range keys {
+			if v, ok := row[k]; ok && v != nil {
+				if s := fmt.Sprintf("%v", v); s != "" {
+					return s
+				}
+			}
+		}
+		return ""
+	}
+
 	reportedCount := ""
-	if v, ok := rows[0]["connection_count"]; ok && v != nil {
-		reportedCount = fmt.Sprintf("%v", v)
+	if v := field(rows[0], "connection_count"); v != "" {
+		reportedCount = v
 	}
 
 	conns := make([]Connection, 0, len(rows))
 	for i, row := range rows {
-		// Both of these are cut to the dashboard column width. cutRunes is
-		// used rather than a byte slice: connection_id is frequently a small
-		// integer (shorter than the column), and client_context is free-form
-		// text that may be multibyte.
+		// Values are cut to their dashboard column widths with cutRunes rather
+		// than a byte slice: a connection_id is often a short integer, and the
+		// free-form fields may be multibyte.
 		id := fmt.Sprintf("c%02d", i+1)
-		if v, ok := row["connection_id"]; ok {
-			if s := cutRunes(fmt.Sprintf("%v", v), 4); s != "" {
-				id = s
-			}
+		if s := cutRunes(field(row, "connection_id"), 4); s != "" {
+			id = s
 		}
 
 		identity := cfg.Name
-		if v, ok := row["client_context"]; ok {
-			if s := cutRunes(fmt.Sprintf("%v", v), 16); s != "" {
-				identity = s
-			}
-		}
-
-		since := time.Duration(0)
-		if v, ok := row["connected_since"]; ok {
-			if t, err := time.Parse(time.RFC3339, fmt.Sprintf("%v", v)); err == nil {
-				since = time.Since(t)
-			}
+		if s := cutRunes(field(row, "server_id", "client_context"), 16); s != "" {
+			identity = s
 		}
 
 		catalog := "_remote"
-		if v, ok := row["catalog"]; ok && v != nil {
-			if s := cutRunes(fmt.Sprintf("%v", v), 12); s != "" {
-				catalog = s
+		if s := cutRunes(field(row, "catalog"), 12); s != "" {
+			catalog = s
+		}
+
+		// A duration only means something while a query is running; an idle
+		// connection reports a null query_started_at.
+		since := time.Duration(0)
+		if v := field(row, "query_started_at", "connected_since"); v != "" {
+			for _, layout := range []string{time.RFC3339, "2006-01-02 15:04:05.999999", "2006-01-02 15:04:05"} {
+				if t, err := time.Parse(layout, v); err == nil {
+					since = time.Since(t)
+					break
+				}
 			}
+		}
+
+		// The server reports idle/active/finished/cancelled; the table renders a
+		// glyph for the ones it knows and leaves the rest plain.
+		status := "active"
+		if s := field(row, "state"); s != "" {
+			status = s
 		}
 
 		conns = append(conns, Connection{
@@ -1000,8 +1038,8 @@ func parseSessionRows(data []byte, cfg ServerConfig) ([]Connection, string, erro
 			Identity: identity,
 			Catalog:  catalog,
 			Duration: since,
-			Queries:  0,
-			Status:   "active",
+			Status:   status,
+			Query:    field(row, "query"),
 		})
 	}
 	return conns, reportedCount, nil

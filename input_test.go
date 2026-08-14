@@ -181,3 +181,51 @@ func TestTLSProxyCycleRegeneratesConfig(t *testing.T) {
 		})
 	}
 }
+
+// The Quack server is HTTP/1.1 (cpp-httplib, no HTTP/2 anywhere), so a
+// generated proxy config must not force HTTP/2 upstream — doing so breaks every
+// request through the proxy. All three generators used to.
+func TestGeneratedProxyConfigsDoNotForceHTTP2Upstream(t *testing.T) {
+	g := NewTLSGenerator([]ServerConfig{{Name: "q", Host: "backend", Port: 9494}})
+	g.fields[0].value = "quack.example.com"
+
+	tests := []struct {
+		proxy    proxyKind
+		wantIn   []string
+		wantNone []string
+	}{
+		{
+			proxy:    proxyCaddy,
+			wantIn:   []string{"versions 1.1", "reverse_proxy backend:9494"},
+			wantNone: []string{"h2c"},
+		},
+		{
+			proxy:  proxyNginx,
+			wantIn: []string{"proxy_http_version 1.1", `proxy_set_header   Connection ""`},
+			// No websocket upgrade in the Quack protocol, and no HTTP/2 upstream.
+			wantNone: []string{"$http_upgrade", "HTTP/2 upstream support"},
+		},
+		{
+			proxy:    proxyEnvoy,
+			wantIn:   []string{"http_protocol_options: {}"},
+			wantNone: []string{"http2_protocol_options"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.proxy.String(), func(t *testing.T) {
+			g.proxy = tc.proxy
+			cfg := g.generateConfig()
+			for _, want := range tc.wantIn {
+				if !strings.Contains(cfg, want) {
+					t.Errorf("%v config missing %q:\n%s", tc.proxy, want, cfg)
+				}
+			}
+			for _, unwanted := range tc.wantNone {
+				if strings.Contains(cfg, unwanted) {
+					t.Errorf("%v config should not contain %q:\n%s", tc.proxy, unwanted, cfg)
+				}
+			}
+		})
+	}
+}

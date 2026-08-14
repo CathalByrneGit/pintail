@@ -63,9 +63,22 @@ func TestAttachPrefix(t *testing.T) {
 			},
 		},
 		{
-			name:    "quack attaches with its token",
-			cfg:     ServerConfig{Name: "q", Type: ConnQuack, Host: "h", Port: 9494, Token: "qk_tok"},
-			wantHas: []string{"ATTACH 'quack://h:9494' AS _remote (TOKEN 'qk_tok')", "USE _remote"},
+			// The quack extension defaults SSL on for any non-local host, so a
+			// plaintext connection has to say so explicitly.
+			name: "quack attaches with its token and disables ssl",
+			cfg:  ServerConfig{Name: "q", Type: ConnQuack, Host: "h", Port: 9494, Token: "qk_tok"},
+			wantHas: []string{
+				"ATTACH 'quack://h:9494' AS _remote (TOKEN 'qk_tok', DISABLE_SSL true)",
+				"USE _remote",
+			},
+		},
+		{
+			name: "quack with TLS keeps ssl on",
+			cfg:  ServerConfig{Name: "q", Type: ConnQuack, Host: "h", Port: 443, Token: "qk_tok", TLS: true},
+			wantHas: []string{
+				"ATTACH 'quack://h:443' AS _remote (TOKEN 'qk_tok', DISABLE_SSL false)",
+			},
+			wantNone: []string{"DISABLE_SSL true"},
 		},
 		{
 			name: "ducklake with a catalog path",
@@ -82,7 +95,7 @@ func TestAttachPrefix(t *testing.T) {
 				CatalogRef: "central", StoragePath: "s3://bucket/lake", StorageSecretRef: "lake_s3"},
 			wantHas: []string{
 				"CREATE OR REPLACE SECRET _storage",
-				"ATTACH 'quack://catalog.internal:9494' AS _catalog (TOKEN 'qk_tok')",
+				"ATTACH 'quack://catalog.internal:9494' AS _catalog (TOKEN 'qk_tok', DISABLE_SSL true)",
 				"ATTACH 'ducklake:_catalog' AS _lake (DATA_PATH 's3://bucket/lake')",
 			},
 		},

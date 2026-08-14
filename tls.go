@@ -283,13 +283,16 @@ func (g TLSGenerator) generateConfig() string {
 func generateCaddy(domain, upstream string) string {
 	return fmt.Sprintf(`# Pintail — Caddyfile
 # Caddy handles TLS automatically (Let's Encrypt or ZeroSSL).
-# Quack uses HTTP/2; h2c forwards cleartext HTTP/2 upstream.
+#
+# The Quack server is HTTP/1.1 with keep-alive (it is built on cpp-httplib and
+# speaks no HTTP/2 at all), so the upstream is pinned to HTTP/1.1. Forcing
+# cleartext HTTP/2 upstream here would break every request through the proxy.
 
 %s {
     reverse_proxy %s {
         transport http {
-            # h2c: forward HTTP/2 cleartext to the Quack process
-            versions h2c
+            versions 1.1
+            keepalive 30s
         }
     }
 
@@ -298,7 +301,9 @@ func generateCaddy(domain, upstream string) string {
         protocols tls1.2 tls1.3
     }
 
-    # Rate-limit unauthenticated probes
+    # Refuse unauthenticated probes. Note this also answers 401 to GET / — the
+    # server's banner endpoint — so health checks against this vhost see a 401
+    # rather than the banner. That is still a reachable server.
     @no_auth {
         not header Authorization *
     }
@@ -315,8 +320,9 @@ http://%s {
 
 func generateNginx(domain, upstream, certFile, keyFile string) string {
 	return fmt.Sprintf(`# Pintail — Nginx config
-# Requires nginx >= 1.25.1 for HTTP/2 upstream support (ngx_http_v2_module).
-# For older nginx, use the grpc_pass directive instead.
+# The Quack server speaks HTTP/1.1 with keep-alive, so proxy_pass with
+# proxy_http_version 1.1 is all that is needed upstream. "http2 on" below is
+# client-facing only and unrelated to the upstream protocol.
 
 upstream quack_backend {
     server %s;
@@ -343,9 +349,10 @@ server {
         proxy_pass         http://quack_backend;
         proxy_http_version 1.1;
 
-        # WebSocket / HTTP/2 upgrade headers
-        proxy_set_header   Upgrade    $http_upgrade;
-        proxy_set_header   Connection "upgrade";
+        # Keep-alive to the upstream: an empty Connection header stops nginx
+        # sending "close" on every request. Quack has no websocket upgrade, so
+        # no Upgrade header is forwarded.
+        proxy_set_header   Connection "";
         proxy_set_header   Host       $host;
         proxy_set_header   X-Real-IP  $remote_addr;
 
@@ -414,12 +421,14 @@ static_resources:
       type: LOGICAL_DNS
       dns_lookup_family: V4_ONLY
       lb_policy: ROUND_ROBIN
-      # h2c upstream: Quack speaks HTTP/2 cleartext
+      # HTTP/1.1 upstream: the Quack server is cpp-httplib and does not speak
+      # HTTP/2, so the explicit config selects the HTTP/1.1 protocol options.
+      # Selecting the HTTP/2 ones here would break every request.
       typed_extension_protocol_options:
         envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
           "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
           explicit_http_config:
-            http2_protocol_options: {}
+            http_protocol_options: {}
       load_assignment:
         cluster_name: quack_cluster
         endpoints:

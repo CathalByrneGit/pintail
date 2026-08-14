@@ -9,7 +9,8 @@ import (
 
 // ── domain types ──────────────────────────────────────────────────────────
 
-// Connection represents a single active client session on a Quack server.
+// Connection represents a single client session on a Quack server, as reported
+// by quack_active_connections().
 type Connection struct {
 	ID       string
 	IP       string
@@ -17,7 +18,11 @@ type Connection struct {
 	Catalog  string
 	Duration time.Duration
 	Queries  int
-	Status   string // "active" | "idle" | "error"
+	Status   string // "idle" | "active" | "finished" | "cancelled"
+	// Query is the SQL the session is running, when the backend reports one.
+	// It is too long for a table column, so the dashboard shows it in the
+	// footer for the selected row.
+	Query string
 }
 
 // ServerInfo is the display-oriented view of a server, derived from a

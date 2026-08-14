@@ -407,6 +407,20 @@ func (m Model) selectedData() (connData, bool) {
 	return m.data[m.selected], true
 }
 
+// selectedSessionQuery is the SQL of the session highlighted in the table, when
+// the backend reported one.
+func (m Model) selectedSessionQuery() string {
+	d, ok := m.selectedData()
+	if !ok {
+		return ""
+	}
+	cursor := m.connTable.Cursor()
+	if cursor < 0 || cursor >= len(d.sessions) {
+		return ""
+	}
+	return d.sessions[cursor].Query
+}
+
 // selectedName is the display name of the selected connection, or "" if none.
 func (m Model) selectedName() string {
 	if m.selected < 0 || m.selected >= len(m.configs) {
@@ -1161,6 +1175,11 @@ func (m Model) viewHeader() string {
 				} else {
 					statusDetail += amberStyle.Render(" HTTP ⚠")
 				}
+				// The ping reaches the server's banner endpoint, so we know
+				// whether a Quack server answered or merely something did.
+				if state.Method != "quack" {
+					statusDetail += amberStyle.Render(" unidentified")
+				}
 			case ConnLocal:
 				statusDetail += mutedStyle.Render(" file")
 			case ConnDuckLake:
@@ -1334,8 +1353,21 @@ func (m Model) viewDashboardFooter() string {
 				mutedStyle.Render("  @  "+row[1])
 		}
 	}
-	divider := mutedStyle.Render(strings.Repeat("─", m.width))
-	return lipgloss.JoinVertical(lipgloss.Left, divider, footerStyle.Render(keys)+hint)
+
+	lines := []string{
+		mutedStyle.Render(strings.Repeat("─", m.width)),
+		footerStyle.Render(keys) + hint,
+	}
+
+	// The SQL a session is running is the most useful thing about it and far too
+	// long for a table column. It gets its own line, since the key row already
+	// fills the width; the panels above shrink by one row to make space, which
+	// the layout does on its own from the footer's height.
+	if q := m.selectedSessionQuery(); q != "" {
+		lines = append(lines, footerStyle.Render(
+			mutedStyle.Render("running  ")+amberStyle.Render(truncate(firstLine(q), m.width-12))))
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, lines...)
 }
 
 // ── Add server screen ─────────────────────────────────────────────────────
@@ -1728,12 +1760,17 @@ func connectionRows(conns []Connection) []table.Row {
 	return rows
 }
 
+// statusGlyph marks the session states quack_active_connections() reports.
 func statusGlyph(s string) string {
 	switch s {
 	case "active":
 		return "● "
 	case "idle":
 		return "◌ "
+	case "finished":
+		return "✓ "
+	case "cancelled":
+		return "⊘ "
 	case "error":
 		return "✕ "
 	}

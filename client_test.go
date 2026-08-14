@@ -88,9 +88,10 @@ func TestParseSessionRowsEmpty(t *testing.T) {
 	}
 }
 
-// QueryAsync used to fall through to the HTTP path for every connection type.
-// Local and DuckLake configs have no Host/Port, so that dialed http://:0 and
-// reported "no endpoint responded", discarding the real failure.
+// QueryAsync used to fall through to an HTTP path for every connection type.
+// For local and DuckLake that dialed http://:0; for Quack it POSTed JSON at
+// endpoints no Quack server serves. Either way the real failure was replaced
+// with "no endpoint responded".
 func TestQueryAsyncErrorReporting(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.duckdb")
@@ -130,11 +131,14 @@ func TestQueryAsyncErrorReporting(t *testing.T) {
 			wantNotHas: "no endpoint responded",
 		},
 		{
-			name:       "quack still falls back to HTTP and reports that failure",
+			// Quack needs the CLI too: its wire protocol is a binary message on
+			// POST /quack, which duckdb speaks and we do not.
+			name:       "quack without the CLI names the real prerequisite",
 			cfg:        ServerConfig{Name: "quack", Type: ConnQuack, Host: "127.0.0.1", Port: 1},
 			online:     true,
-			wantMethod: "http",
-			wantErrHas: "no endpoint responded",
+			wantMethod: "cli",
+			wantErrHas: "duckdb CLI not found in PATH",
+			wantNotHas: "no endpoint responded",
 		},
 	}
 

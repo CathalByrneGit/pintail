@@ -183,42 +183,121 @@ func TestRootModelRoutesCtrlCWhileQuerying(t *testing.T) {
 	}
 }
 
-// The CLI subcommand used to refuse outright without a duckdb binary, even for
-// a Quack server it could reach over HTTP.
-func TestQueryOverHTTPWithoutTheCLI(t *testing.T) {
+// The ping for a Quack connection goes over HTTP to the server's banner
+// endpoint, which is what lets it tell a Quack server apart from any other
+// process holding the port. The query path that used to POST JSON at invented
+// endpoints is gone: no Quack server ever served them.
+func TestPingQuackIdentifiesTheEndpoint(t *testing.T) {
+	tests := []struct {
+		name          string
+		body          string
+		status        int
+		wantOnline    bool
+		wantMethod    string
+		wantConfirmed bool
+	}{
+		{
+			name:          "a real Quack server identifies itself",
+			body:          "This is a DuckDB Quack RPC endpoint. Use ATTACH 'quack:...' to connect here.\n",
+			status:        200,
+			wantOnline:    true,
+			wantMethod:    "quack",
+			wantConfirmed: true,
+		},
+		{
+			name:       "some other HTTP server is reachable but unidentified",
+			body:       "<html>nginx</html>",
+			status:     200,
+			wantOnline: true,
+			wantMethod: "http",
+		},
+		{
+			// The Caddyfile Pintail generates answers 401 to unauthenticated
+			// requests, so a refusal is a working deployment, not an outage.
+			name:       "a proxy that refuses GET / still counts as reachable",
+			body:       "",
+			status:     401,
+			wantOnline: true,
+			wantMethod: "http",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != "GET" || r.URL.Path != "/" {
+					http.NotFound(w, r)
+					return
+				}
+				w.WriteHeader(tc.status)
+				fmt.Fprint(w, tc.body)
+			}))
+			defer srv.Close()
+
+			cfg := quackConfigFor(t, srv.URL)
+			c := NewQuackClient(cfg, nil, nil)
+
+			_, err := c.Ping(context.Background())
+			st := c.GetState()
+			if (err == nil) != tc.wantOnline {
+				t.Fatalf("ping err = %v, want online = %v", err, tc.wantOnline)
+			}
+			if st.Online != tc.wantOnline {
+				t.Errorf("Online = %v, want %v", st.Online, tc.wantOnline)
+			}
+			if st.Method != tc.wantMethod {
+				t.Errorf("Method = %q, want %q", st.Method, tc.wantMethod)
+			}
+
+			confirmed, err := c.probeQuackHTTP(context.Background())
+			if err != nil {
+				t.Fatalf("probe: %v", err)
+			}
+			if confirmed != tc.wantConfirmed {
+				t.Errorf("confirmed = %v, want %v", confirmed, tc.wantConfirmed)
+			}
+		})
+	}
+}
+
+func TestPingQuackOfflineWhenNothingListens(t *testing.T) {
+	// Port 1 on loopback: nothing is there.
+	c := NewQuackClient(ServerConfig{Name: "q", Type: ConnQuack, Host: "127.0.0.1", Port: 1}, nil, nil)
+	if _, err := c.Ping(context.Background()); err == nil {
+		t.Fatal("want an error when nothing is listening")
+	}
+	if st := c.GetState(); st.Online || st.ErrMsg == "" {
+		t.Errorf("state = %+v, want offline with a reason", st)
+	}
+}
+
+// The ping sends the token, so a server behind auth can still be probed.
+func TestPingQuackSendsTheToken(t *testing.T) {
 	var gotAuth string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
-		if r.URL.Path != "/query" {
-			http.NotFound(w, r)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `[{"answer":42}]`)
+		fmt.Fprint(w, "This is a DuckDB Quack RPC endpoint.\n")
 	}))
 	defer srv.Close()
 
-	host, port := splitHostPort(strings.TrimPrefix(srv.URL, "http://"))
-	cfg := ServerConfig{Name: "quack", Type: ConnQuack, Host: host, Token: "qk_secret"}
-	fmt.Sscanf(port, "%d", &cfg.Port)
-
+	cfg := quackConfigFor(t, srv.URL)
+	cfg.Token = "qk_secret"
 	c := NewQuackClient(cfg, nil, nil)
-	c.hasCLI = false // the point of the test
 	if _, err := c.Ping(context.Background()); err != nil {
 		t.Fatalf("ping: %v", err)
-	}
-
-	r := c.Query(context.Background(), "SELECT 42 AS answer;")
-	if r.Err != "" {
-		t.Fatalf("query failed without the CLI: %s", r.Err)
-	}
-	if r.Method != "http" {
-		t.Errorf("Method = %q, want http", r.Method)
-	}
-	if len(r.Rows) != 1 || r.Rows[0][0] != "42" {
-		t.Errorf("rows = %v, want [[42]]", r.Rows)
 	}
 	if gotAuth != "Bearer qk_secret" {
 		t.Errorf("Authorization = %q, want the bearer token", gotAuth)
 	}
+}
+
+// quackConfigFor builds a plaintext Quack config pointing at a test server.
+func quackConfigFor(t *testing.T, url string) ServerConfig {
+	t.Helper()
+	host, port := splitHostPort(strings.TrimPrefix(url, "http://"))
+	cfg := ServerConfig{Name: "quack", Type: ConnQuack, Host: host}
+	if _, err := fmt.Sscanf(port, "%d", &cfg.Port); err != nil {
+		t.Fatalf("parsing test server port %q: %v", port, err)
+	}
+	return cfg
 }

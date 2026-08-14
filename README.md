@@ -156,11 +156,11 @@ In another terminal, launch Pintail and add a Quack connection:
 - Host: `localhost`,  Port: `9494`,  Token: *(paste the auth_token)*,  TLS: `n`
 - `enter` to save
 
-The connection chip flips from `× offline` to `● online`, the sessions
-panel reports the session's own connection plus the backend's connection
-count (DuckDB exposes no per-connection listing), and the catalog tree
-shows the real tables. The scratchpad now runs queries via
-HTTP to the Quack server.
+The connection chip flips from `× offline` to `● online`, the sessions panel
+lists the server's live sessions from `quack_active_connections()` — id, state,
+and the SQL each one is running — and the catalog tree shows the real tables.
+The scratchpad runs queries through the local `duckdb` binary, which speaks the
+Quack protocol; Pintail does not implement the wire format itself.
 
 **For external access**, bind to a non-local interface and front with a
 TLS-terminating reverse proxy:
@@ -170,7 +170,9 @@ CALL quack_serve('quack:0.0.0.0:9494', allow_other_hostname => true);
 ```
 
 Pintail's **TLS config** screen (`x`) generates ready-to-deploy Caddy /
-Nginx / Envoy configs with the `h2c` upgrade Quack needs. The **Auth
+Nginx / Envoy configs. The Quack server is HTTP/1.1 with keep-alive, so the
+generated configs proxy HTTP/1.1 upstream — forcing HTTP/2 (`h2c`) at the proxy
+would break it. The **Auth
 policy** screen (`p`) manages per-token grants via `ALTER SECRET` — which
 is not a statement stock DuckDB accepts (it is a parser error as of 1.5.5),
 so applying it needs a Quack server that implements it. The screen says so,
@@ -202,7 +204,7 @@ query routing, and metadata fetch accordingly.
 
 | Type       | Use it for                          | Reachability                     | Query routing                                                                                                          |
 |------------|-------------------------------------|----------------------------------|------------------------------------------------------------------------------------------------------------------------|
-| `quack`    | Remote DuckDB via Quack             | TCP `host:port`                  | `ATTACH 'quack://…' AS _remote (TOKEN '…'); USE _remote;`                                                              |
+| `quack`    | Remote DuckDB via Quack             | `GET /` banner check             | `ATTACH 'quack://…' AS _remote (TOKEN '…', DISABLE_SSL …); USE _remote;`                                                |
 | `local`    | Plain `.duckdb` file on disk        | `os.Stat(path)`                  | `duckdb <path> -json -c "<sql>"` (file opened directly via argv; a `storage_secret_ref` is prepended as `CREATE SECRET`) |
 | `ducklake` | DuckLake lakehouse                  | TCP dial of catalog host / stat  | `INSTALL ducklake; LOAD ducklake; ATTACH 'ducklake:…' AS _lake (DATA_PATH '…'); USE _lake;`                            |
 
