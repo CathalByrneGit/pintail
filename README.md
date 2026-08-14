@@ -170,14 +170,22 @@ CALL quack_serve('quack:0.0.0.0:9494', allow_other_hostname => true);
 ```
 
 Pintail's **TLS config** screen (`x`) generates ready-to-deploy Caddy /
-Nginx / Envoy configs. The Quack server is HTTP/1.1 with keep-alive, so the
-generated configs proxy HTTP/1.1 upstream — forcing HTTP/2 (`h2c`) at the proxy
-would break it. The **Auth
-policy** screen (`p`) manages per-token grants via `ALTER SECRET` — which
-is not a statement stock DuckDB accepts (it is a parser error as of 1.5.5),
-so applying it needs a Quack server that implements it. The screen says so,
-and permission toggles are saved back to the token list either way. For
-the full security model see the
+Nginx / Envoy configs following the [Quack reverse-proxy
+guide](https://duckdb.org/docs/current/quack/setup/reverse_proxy): HTTP/1.1
+upstream with keep-alive (the server speaks plain HTTP only), unbuffered
+responses so streamed `FETCH`es pass straight through, a 256 MB body cap for
+`PREPARE`/`APPEND`, and timeouts long enough for a query that sits between
+fetches for minutes.
+
+The **Auth policy** screen (`p`) generates Quack's authorization hook — a
+`(connection_id, query) → BOOLEAN` macro plus
+`SET GLOBAL quack_authorization_function` — from the permission toggles, and
+applies it on the server via `quack_query`. Two limits the screen states rather
+than hides: the hook is **per server, not per token** (scoping to one token
+needs an authentication hook recording `connection_id` → user), and prefix
+matching over statement text is not airtight — `WITH x AS (…) INSERT …` begins
+with `WITH` yet still writes. For real read-only enforcement, attach read-only
+or inspect the parsed statement type. See the
 [Quack security docs](https://duckdb.org/docs/current/quack/security).
 
 ### Bootstrapping the config file directly
@@ -244,7 +252,7 @@ or a bare path to a `.duckdb` or `.sqlite` file (extension-based detection).
 | **SQL scratchpad**      | `s` | Quick verification queries; **CSV / Parquet export** via `ctrl+e` (for audit trails, not analytics)                     |
 | **DuckLake snapshots**  | `l` | List `<catalog>.snapshots()`; renders time-travel and `ducklake_expire_snapshots` SQL                                   |
 | **TLS config**          | `x` | Generate Caddy / Nginx / Envoy reverse-proxy configs for HTTPS termination                                              |
-| **Auth policy**         | `p` | Toggle per-token SQL permissions (saved back to the token list); emit `ALTER SECRET` statements                         |
+| **Auth policy**         | `p` | Toggle SQL permissions (saved back to the token list); generate and apply Quack's authorization hook macro               |
 | **Connections**         | `a` | Add, edit, delete connections; persisted to `~/.duckdb/pintail.json`                                                   |
 
 ### Storage secrets
@@ -367,9 +375,14 @@ the CLI, and say so if it's missing.
 
 Three independent timers keep subprocess spawning under control:
 
-- **Ping** (5s) — cheap reachability check (TCP dial or file stat). No subprocess.
-  A `local` connection whose path is a remote URI is not probed at all.
-- **Sessions** (15s) — refreshes sessions/snapshots for *online* connections.
+- **Ping** (5s) — cheap reachability check, no subprocess: an HTTP `GET /` for
+  `quack` (which also confirms a Quack server answered, not merely that
+  something holds the port), a file stat for `local`, a TCP dial or stat for a
+  `ducklake` catalog. A `local` connection whose path is a remote URI is not
+  probed at all.
+- **Sessions** (15s) — refreshes sessions/snapshots for *online* connections. For
+  `quack`, the server's own `quack_active_connections()` is run remotely through
+  `quack_query`, since the function reports on whichever process evaluates it.
 - **Catalog** — fetched once on each offline→online transition, plus on demand via `r`.
 
 Every result is stored against the connection that produced it, so polls from
@@ -490,7 +503,7 @@ pintail/
 ├── secrets.go     — Storage secret manager (mode 2 of the secrets screen)
 ├── ducklake.go    — snapshots view, time-travel / expire-snapshots SQL
 ├── tls.go         — Caddy / Nginx / Envoy config generators
-├── auth.go        — per-token permission grid + ALTER SECRET generator
+├── auth.go        — permission grid + Quack authorization-hook generator
 ├── version.go     — version string, stampable with -ldflags
 └── .github/workflows/ci.yml — fmt / vet / build / test -race, with a real duckdb
 ```

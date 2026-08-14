@@ -220,19 +220,24 @@ func (a AuthEditor) Update(msg tea.Msg) (AuthEditor, tea.Cmd) {
 	return a, nil
 }
 
-// authApplyResultMsg carries the outcome of an ALTER SECRET apply back to this
-// screen rather than to the scratchpad.
+// authApplyResultMsg carries the outcome of a policy apply back to this screen
+// rather than to the scratchpad.
 type authApplyResultMsg struct {
 	target string
 	err    string
 }
 
-// applyPolicyCmd runs the generated policy SQL against one connection.
+// applyPolicyCmd installs the generated policy on the server.
+//
+// The macro and the setting have to exist in the server process — that is where
+// the authorization hook runs — so this goes through quack_query() rather than
+// our own attached session, which would have created the macro locally and left
+// the server's policy untouched.
 func applyPolicyCmd(c *QuackClient, sql string) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		if _, err := c.queryCLI(ctx, sql); err != nil {
+		if err := c.runServerSQL(ctx, sql); err != nil {
 			return authApplyResultMsg{target: c.Config.Name, err: err.Error()}
 		}
 		return authApplyResultMsg{target: c.Config.Name}
@@ -345,12 +350,11 @@ func (a AuthEditor) ViewPermGrid(width int) string {
 	sql := a.applySQL(p)
 	lines = append(lines, renderCodeBlock(sql, width-4))
 
-	// ALTER SECRET is not a statement stock DuckDB accepts (it is a parser
-	// error as of 1.5.5) — whether it works depends entirely on what the Quack
-	// server adds. Saying so beats letting an apply fail mysteriously.
+	// The hook is global to the server. Presenting per-token toggles without
+	// saying so would imply an isolation Quack does not provide.
 	lines = append(lines,
-		mutedStyle.Render("  ALTER SECRET is not stock DuckDB syntax — applying it"),
-		mutedStyle.Render("  requires a Quack server that implements it."))
+		mutedStyle.Render("  Quack runs one authorization hook per server, so applying this"),
+		mutedStyle.Render("  sets the policy for every token — see the comments in the SQL."))
 
 	// Where an apply would go, so [a] is never a surprise.
 	target := mutedStyle.Render("  apply target  ") + redStyle.Render("none configured")
@@ -404,29 +408,67 @@ func (a AuthEditor) ViewFooter() string {
 
 // ── SQL generator ─────────────────────────────────────────────────────────
 
+// authzMacroName is the macro the generated policy defines on the server.
+const authzMacroName = "pintail_authz"
+
+// statementPrefixes maps a toggled operation to the statement keywords that
+// begin such a query. SELECT covers DuckDB's FROM-first syntax and the read-only
+// shapes the Quack docs group with it.
+func statementPrefixes(op string) []string {
+	switch op {
+	case "SELECT":
+		return []string{"SELECT", "FROM", "WITH", "EXPLAIN", "DESCRIBE", "SHOW"}
+	default:
+		return []string{op}
+	}
+}
+
+// applySQL renders the policy as what Quack actually enforces.
+//
+// Quack has no per-token grant table and no ALTER SECRET statement — the
+// previous version of this generator emitted one, which is a parser error. What
+// exists is a single authorization callback per server: a function named by the
+// quack_authorization_function setting, invoked as
+// `SELECT <fn>(<connection_id>, <query>)` before every query, admitting it on
+// TRUE. The default returns TRUE for everything.
+//
+// So the toggles compile into a macro over the statement text. Two limits are
+// stated in the output rather than hidden: the hook is global to the server, and
+// prefix matching is not a robust filter.
 func (a AuthEditor) applySQL(p PolicyEntry) string {
-	var ops []string
+	var ops, prefixes []string
 	for _, perm := range p.Perms {
 		if perm.Allowed && perm.Op != "ALL" {
 			ops = append(ops, perm.Op)
+			prefixes = append(prefixes, statementPrefixes(perm.Op)...)
 		}
 	}
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "-- Authorization policy derived from token: %s\n", p.TokenName)
 	if len(ops) == 0 {
-		ops = []string{"NONE"}
+		sb.WriteString("-- Nothing is allowed: this denies every query.\n")
+	} else {
+		fmt.Fprintf(&sb, "-- Allowed: %s\n", strings.Join(ops, ", "))
 	}
+	sb.WriteString("--\n")
+	sb.WriteString("-- Quack's authorization hook is per SERVER, not per token. To scope a\n")
+	sb.WriteString("-- policy to one token, add an authentication hook that records\n")
+	sb.WriteString("-- connection_id → user, then look it up here via the sid argument.\n")
 
-	scope := "*"
-	if len(p.Scope) > 0 && p.Scope[0] != "*" {
-		scope = strings.Join(p.Scope, ", ")
+	if len(ops) == 0 {
+		fmt.Fprintf(&sb, "CREATE OR REPLACE MACRO %s(sid, query) AS false;\n", authzMacroName)
+	} else {
+		sb.WriteString("-- Prefix matching is illustrative, not airtight: a query like\n")
+		sb.WriteString("-- WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x starts with WITH\n")
+		sb.WriteString("-- yet still writes. For real read-only enforcement, attach the database\n")
+		sb.WriteString("-- read-only or inspect the parsed statement type instead.\n")
+		fmt.Fprintf(&sb, "CREATE OR REPLACE MACRO %s(sid, query) AS\n", authzMacroName)
+		fmt.Fprintf(&sb, "    regexp_matches(upper(trim(query)), '^(%s)\\b');\n",
+			strings.Join(prefixes, "|"))
 	}
-
-	return fmt.Sprintf(
-		"-- Update permissions for token: %s\nALTER SECRET %s\n  SET PERMISSIONS (%s)\n  FOR SCOPE '%s';",
-		p.TokenName,
-		p.TokenName,
-		strings.Join(ops, ", "),
-		scope,
-	)
+	fmt.Fprintf(&sb, "SET GLOBAL quack_authorization_function = '%s';", authzMacroName)
+	return sb.String()
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────

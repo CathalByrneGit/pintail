@@ -229,3 +229,55 @@ func TestGeneratedProxyConfigsDoNotForceHTTP2Upstream(t *testing.T) {
 		})
 	}
 }
+
+// The Quack reverse-proxy guide documents four settings without which a proxied
+// server misbehaves: large request bodies (PREPARE carries SQL, APPEND carries
+// DataChunks), unbuffered responses (results stream back as repeated FETCHes),
+// long timeouts (a query can sit between FETCHes for minutes), and upstream
+// keep-alive (the server keeps connection state on the persistent connection).
+func TestGeneratedProxyConfigsCarryTheDocumentedSettings(t *testing.T) {
+	g := NewTLSGenerator([]ServerConfig{{Name: "q", Host: "127.0.0.1", Port: 9494}})
+	g.fields[0].value = "quack.example.com"
+
+	tests := []struct {
+		proxy  proxyKind
+		wantIn []string
+	}{
+		{
+			proxy: proxyCaddy,
+			wantIn: []string{
+				"flush_interval -1", // unbuffered streaming
+				"max_size 256MB",    // large bodies
+				"keepalive 30s",     // upstream keep-alive
+			},
+		},
+		{
+			proxy: proxyNginx,
+			wantIn: []string{
+				"client_max_body_size 256M",
+				"proxy_buffering off",
+				"proxy_read_timeout  600s",
+				`proxy_set_header   Connection ""`,
+			},
+		},
+		{
+			proxy: proxyEnvoy,
+			wantIn: []string{
+				"timeout: 600s", // Envoy defaults to 15s
+				"per_connection_buffer_limit_bytes: 268435456", // 1 MiB default is too small
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.proxy.String(), func(t *testing.T) {
+			g.proxy = tc.proxy
+			cfg := g.generateConfig()
+			for _, want := range tc.wantIn {
+				if !strings.Contains(cfg, want) {
+					t.Errorf("%v config missing %q:\n%s", tc.proxy, want, cfg)
+				}
+			}
+		})
+	}
+}

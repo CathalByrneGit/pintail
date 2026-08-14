@@ -368,6 +368,18 @@ func (c ServerConfig) quackAttachOptions() []string {
 	return append(opts, "DISABLE_SSL true")
 }
 
+// quackQuerySQL wraps sql so the *server* runs it, via quack_query(). Anything
+// that has to take effect on the server rather than in our own session — the
+// active-connection list, an authorization policy — goes through here; running
+// it locally would either describe the wrong process or configure the wrong one.
+func (c ServerConfig) quackQuerySQL(sql string) string {
+	return fmt.Sprintf(
+		"INSTALL quack; LOAD quack; SELECT * FROM quack_query('%s', '%s', %s);",
+		sqlQuote(c.QuackURI()), sqlQuote(sql),
+		strings.Join(c.quackQueryOptions(), ", "),
+	)
+}
+
 // quackQueryOptions renders the named parameters for quack_query(), which take
 // `name = value` form rather than the bare option list ATTACH uses.
 func (c ServerConfig) quackQueryOptions() []string {
@@ -883,15 +895,9 @@ func (c *QuackClient) FetchSessionsCmd(idx int) tea.Cmd {
 // current_connection_id() and duckdb_connection_count() — honest about what it
 // was, but describing the wrong process.
 func (c *QuackClient) fetchQuackSessions(ctx context.Context, idx int) tea.Msg {
-	sql := fmt.Sprintf(
-		"INSTALL quack; LOAD quack; SELECT * FROM quack_query('%s', '%s', %s);",
-		sqlQuote(c.Config.QuackURI()),
-		sqlQuote("FROM quack_active_connections()"),
-		strings.Join(c.Config.quackQueryOptions(), ", "),
-	)
-
 	// Deliberately not via cliArgs: quack_query connects to the server itself,
 	// so this must not be preceded by the ATTACH prologue.
+	sql := c.Config.quackQuerySQL("FROM quack_active_connections()")
 	cmd := exec.CommandContext(ctx, c.cliPath, "-json", "-c", sql)
 	out, err := cmd.Output()
 	if err != nil {
@@ -899,6 +905,23 @@ func (c *QuackClient) fetchQuackSessions(ctx context.Context, idx int) tea.Msg {
 	}
 	conns, reported, err := parseSessionRows(out, c.Config)
 	return sessionResultMsg{idx: idx, connections: conns, reportedCount: reported, err: err}
+}
+
+// runServerSQL executes sql inside the Quack server via quack_query, without
+// our own ATTACH prologue — for statements that must take effect on the server,
+// such as installing an authorization hook.
+func (c *QuackClient) runServerSQL(ctx context.Context, sql string) error {
+	if !c.hasCLI {
+		return fmt.Errorf("duckdb CLI not found in PATH")
+	}
+	cmd := exec.CommandContext(ctx, c.cliPath, "-json", "-c", c.Config.quackQuerySQL(sql))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		if trimmed := strings.TrimSpace(string(out)); trimmed != "" {
+			return fmt.Errorf("%s", trimmed)
+		}
+		return err
+	}
+	return nil
 }
 
 // cliError prefers the subprocess's stderr over Go's bare "exit status 1",

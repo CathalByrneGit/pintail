@@ -284,30 +284,35 @@ func generateCaddy(domain, upstream string) string {
 	return fmt.Sprintf(`# Pintail — Caddyfile
 # Caddy handles TLS automatically (Let's Encrypt or ZeroSSL).
 #
-# The Quack server is HTTP/1.1 with keep-alive (it is built on cpp-httplib and
-# speaks no HTTP/2 at all), so the upstream is pinned to HTTP/1.1. Forcing
-# cleartext HTTP/2 upstream here would break every request through the proxy.
+# The Quack server speaks plain HTTP only — HTTP/1.1 with keep-alive, no HTTP/2 —
+# so the upstream is pinned to 1.1. Forcing cleartext HTTP/2 upstream here would
+# break every request through the proxy.
 
 %s {
     reverse_proxy %s {
+        # Quack streams results back as repeated FETCH responses. Buffering
+        # them in Caddy defeats the streaming and inflates memory; -1 flushes
+        # immediately (the equivalent of nginx proxy_buffering off).
+        flush_interval -1
+
+        # Quack keeps server-side connection state alive on the persistent
+        # HTTP connection, so keep-alive upstream is correctness, not just speed.
         transport http {
             versions 1.1
             keepalive 30s
         }
     }
 
+    # PREPARE carries SQL and APPEND carries inserted DataChunks, so request
+    # bodies are far larger than the default cap allows.
+    request_body {
+        max_size 256MB
+    }
+
     # Optional: tighten TLS
     tls {
         protocols tls1.2 tls1.3
     }
-
-    # Refuse unauthenticated probes. Note this also answers 401 to GET / — the
-    # server's banner endpoint — so health checks against this vhost see a 401
-    # rather than the banner. That is still a reachable server.
-    @no_auth {
-        not header Authorization *
-    }
-    respond @no_auth 401
 }
 
 # Redirect plain HTTP → HTTPS (Caddy does this automatically,
@@ -342,6 +347,10 @@ server {
     ssl_session_cache   shared:SSL:10m;
     ssl_session_timeout 1d;
 
+    # PREPARE carries SQL and APPEND carries inserted DataChunks; the 1 MiB
+    # nginx default fails mid-INSERT.
+    client_max_body_size 256M;
+
     # HSTS (optional — enable after verifying TLS works)
     # add_header Strict-Transport-Security "max-age=63072000" always;
 
@@ -359,9 +368,14 @@ server {
         # Forward the Quack auth token as-is
         proxy_pass_header  Authorization;
 
-        # Generous timeouts for long-running analytical queries
-        proxy_read_timeout  300s;
-        proxy_send_timeout  300s;
+        # Quack streams results via repeated FETCH responses; buffering through
+        # nginx defeats the streaming and inflates memory.
+        proxy_buffering off;
+
+        # A long-running query can sit on the wire between FETCHes for minutes,
+        # well past nginx's 60s default.
+        proxy_read_timeout  600s;
+        proxy_send_timeout  600s;
         proxy_connect_timeout 5s;
     }
 }
@@ -386,6 +400,7 @@ static_resources:
     - name: quack_tls_listener
       address:
         socket_address: { address: 0.0.0.0, port_value: 443 }
+      per_connection_buffer_limit_bytes: 268435456
       filter_chains:
         - transport_socket:
             name: envoy.transport_sockets.tls
@@ -409,8 +424,12 @@ static_resources:
                     - name: quack_service
                       domains: ["%s"]
                       routes:
-                        - match:  { prefix: "/" }
-                          route:  { cluster: quack_cluster }
+                        - match: { prefix: "/" }
+                          route:
+                            cluster: quack_cluster
+                            # Envoy's default route timeout is 15s, which cuts
+                            # off a query still streaming FETCH responses.
+                            timeout: 600s
                 http_filters:
                   - name: envoy.filters.http.router
                     typed_config:
@@ -421,6 +440,8 @@ static_resources:
       type: LOGICAL_DNS
       dns_lookup_family: V4_ONLY
       lb_policy: ROUND_ROBIN
+      # PREPARE / APPEND bodies are much larger than the 1 MiB default buffer.
+      per_connection_buffer_limit_bytes: 268435456
       # HTTP/1.1 upstream: the Quack server is cpp-httplib and does not speak
       # HTTP/2, so the explicit config selects the HTTP/1.1 protocol options.
       # Selecting the HTTP/2 ones here would break every request.

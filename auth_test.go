@@ -125,16 +125,78 @@ func TestAuthEditorReportsApplyOutcome(t *testing.T) {
 	}
 }
 
-// The generated statement is not stock DuckDB syntax; the screen has to say so.
-func TestAuthEditorFlagsNonStandardSQL(t *testing.T) {
+// The generated policy has to be the mechanism Quack actually enforces — an
+// authorization callback macro plus the setting that points at it — not the
+// ALTER SECRET statement this screen used to emit, which DuckDB cannot parse.
+func TestAuthEditorGeneratesTheRealAuthorizationHook(t *testing.T) {
+	tok := buildToken("etl", "analytics", "SELECT, INSERT", "never")
+	a := NewAuthEditor([]Token{tok}, nil)
+
+	sql := a.applySQL(a.policies[0])
+
+	for _, want := range []string{
+		"CREATE OR REPLACE MACRO pintail_authz(sid, query)",
+		"regexp_matches(upper(trim(query))",
+		"SET GLOBAL quack_authorization_function = 'pintail_authz';",
+		"SELECT", "INSERT",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Errorf("generated SQL missing %q:\n%s", want, sql)
+		}
+	}
+	if strings.Contains(sql, "ALTER SECRET") {
+		t.Errorf("generated SQL still uses ALTER SECRET, which DuckDB cannot parse:\n%s", sql)
+	}
+	// DuckDB's FROM-first syntax is a read, and so are the other read shapes the
+	// Quack docs group with SELECT.
+	for _, want := range []string{"FROM", "WITH", "EXPLAIN", "DESCRIBE", "SHOW"} {
+		if !strings.Contains(sql, want) {
+			t.Errorf("SELECT should admit %q as a read shape:\n%s", want, sql)
+		}
+	}
+	// Operations that were not granted must not appear in the pattern.
+	for _, unwanted := range []string{"DROP", "DELETE"} {
+		if strings.Contains(sql, "|"+unwanted) || strings.Contains(sql, "("+unwanted) {
+			t.Errorf("ungranted %q leaked into the pattern:\n%s", unwanted, sql)
+		}
+	}
+	// The limits are stated, not hidden.
+	if !strings.Contains(sql, "per SERVER") {
+		t.Errorf("the SQL should say the hook is global to the server:\n%s", sql)
+	}
+	if !strings.Contains(sql, "not airtight") {
+		t.Errorf("the SQL should carry the prefix-matching caveat:\n%s", sql)
+	}
+}
+
+func TestAuthEditorDenyAllPolicy(t *testing.T) {
+	tok := buildToken("locked", "*", "", "never")
+	a := NewAuthEditor([]Token{tok}, nil)
+	// Clear everything, including the SELECT default buildToken applies.
+	for i := range a.policies[0].Perms {
+		a.policies[0].Perms[i].Allowed = false
+	}
+
+	sql := a.applySQL(a.policies[0])
+	if !strings.Contains(sql, "AS false;") {
+		t.Errorf("a policy with nothing granted should deny every query:\n%s", sql)
+	}
+	if strings.Contains(sql, "regexp_matches") {
+		t.Errorf("deny-all needs no pattern:\n%s", sql)
+	}
+}
+
+// The panel has to say that the hook is server-wide, since the screen presents
+// per-token toggles and Quack provides no per-token isolation.
+func TestAuthEditorStatesTheHookIsServerWide(t *testing.T) {
 	a := NewAuthEditor([]Token{buildToken("t", "analytics", "SELECT", "never")}, nil)
 	grid := a.ViewPermGrid(80)
 
-	if !strings.Contains(grid, "ALTER SECRET") {
-		t.Error("the generated SQL should still be shown")
+	if !strings.Contains(grid, "quack_authorization_function") {
+		t.Errorf("the generated SQL should be shown:\n%s", grid)
 	}
-	if !strings.Contains(grid, "not stock DuckDB syntax") {
-		t.Error("the panel should warn that ALTER SECRET is not stock DuckDB syntax")
+	if !strings.Contains(grid, "one authorization hook per server") {
+		t.Errorf("the panel should say the hook is server-wide:\n%s", grid)
 	}
 }
 
