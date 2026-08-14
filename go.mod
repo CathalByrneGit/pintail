@@ -1,4 +1,4 @@
-module github.com/example/pintail
+module github.com/CathalByrneGit/pintail
 
 go 1.22
 

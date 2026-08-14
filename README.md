@@ -330,6 +330,7 @@ pintail ping prod-quack            # one-shot reachability check
 pintail ping lake-prod --json      # exit code + JSON
 pintail query lake-prod "SELECT * FROM orders LIMIT 5"
 pintail query lake-prod "SELECT COUNT(*) FROM orders" --json
+pintail version                    # print the version
 pintail help
 ```
 
@@ -349,15 +350,42 @@ Three independent timers keep subprocess spawning under control:
 Requires Go 1.22+.
 
 ```bash
-unzip pintail-src.zip && cd pintail
-go mod tidy
+git clone https://github.com/CathalByrneGit/pintail
+cd pintail
 go build -o pintail .
 ./pintail
+```
+
+Or install straight from the module path:
+
+```bash
+go install github.com/CathalByrneGit/pintail@latest
+```
+
+Stamp a version into the binary with ldflags (it defaults to the value in
+`version.go`, and `pintail version` prints it):
+
+```bash
+go build -ldflags "-X main.version=$(git describe --tags --always)" -o pintail .
 ```
 
 For live queries, also install the DuckDB CLI: `duckdb` needs to be on
 `$PATH`. For DuckLake, ensure the `ducklake` extension installs
 (DuckDB ≥ 1.3.0).
+
+## Tests
+
+```bash
+go test ./...                # unit tests
+go test -race ./...           # what CI runs
+```
+
+Tests that talk to a real database skip themselves unless `duckdb` is on
+`$PATH` — they are the ones that catch generated SQL referencing columns or
+functions that don't exist, so it's worth having the CLI installed when
+running them locally. CI (`.github/workflows/ci.yml`) installs a pinned DuckDB,
+runs `gofmt`/`vet`/`build`/`test -race` against the Go floor and current
+stable, and fails if the integration tests silently skipped.
 
 ## Configuration
 
@@ -425,7 +453,9 @@ pintail/
 ├── secrets.go     — Storage secret manager (mode 2 of the secrets screen)
 ├── ducklake.go    — snapshots view, time-travel / expire-snapshots SQL
 ├── tls.go         — Caddy / Nginx / Envoy config generators
-└── auth.go        — per-token permission grid + ALTER SECRET generator
+├── auth.go        — per-token permission grid + ALTER SECRET generator
+├── version.go     — version string, stampable with -ldflags
+└── .github/workflows/ci.yml — fmt / vet / build / test -race, with a real duckdb
 ```
 
 ## Architecture notes

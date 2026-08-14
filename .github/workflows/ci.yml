@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Pinned so a DuckDB release cannot change what CI means overnight. Bump
+  # deliberately — the integration tests assert against real SQL behaviour, so
+  # a bump here is how we find out that behaviour moved.
+  DUCKDB_VERSION: v1.5.5
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor from go.mod, plus whatever is current.
+        go: ["1.22", "stable"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: true
+
+      - name: Install the duckdb CLI
+        # Without this the integration tests skip, which is exactly the
+        # coverage worth having: they are what caught the catalog and session
+        # queries referencing SQL that does not exist.
+        run: |
+          curl -fsSL -o duckdb.zip \
+            "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/duckdb_cli-linux-amd64.zip"
+          unzip -q duckdb.zip -d "$HOME/.local/bin"
+          chmod +x "$HOME/.local/bin/duckdb"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Check duckdb is on PATH
+        run: duckdb --version
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        run: go test -race ./...
+
+      - name: Confirm the integration tests actually ran
+        # A silent skip would hide the loss of the only coverage that talks to
+        # real DuckDB, so treat "everything skipped" as a failure.
+        run: |
+          go test -run 'RealDuckDB' -v ./... | tee out.txt
+          if ! grep -q -- '--- PASS: TestMetadataQueriesAgainstRealDuckDB' out.txt; then
+            echo "The DuckDB integration test did not run."
+            exit 1
+          fi

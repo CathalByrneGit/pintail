@@ -930,7 +930,7 @@ func (m Model) viewHeader() string {
 	titleBar := headerBarStyle.Width(m.width).Render(
 		titleStyle.Render("🦆 Pintail") +
 			mutedStyle.Render("  ─  DuckDB Quack Protocol Manager  ") +
-			mutedStyle.Render("v0.1.0"),
+			mutedStyle.Render(versionLabel()),
 	)
 
 	var chips []string
@@ -1110,7 +1110,7 @@ func (m Model) viewAddServerScreen() string {
 		titleStyle.Render("🦆 Pintail") +
 			mutedStyle.Render("  ─  ") +
 			labelStyle.Render("Add Connection") +
-			mutedStyle.Render("  v0.1.0"),
+			mutedStyle.Render("  "+versionLabel()),
 	)
 	divider := mutedStyle.Render(strings.Repeat("─", m.width))
 
@@ -1245,7 +1245,7 @@ func editingTitle(f *addServerForm) string {
 func (m Model) viewSnapshotsScreen() string {
 	titleBar := headerBarStyle.Width(m.width).Render(
 		titleStyle.Render("🦆 Pintail") + mutedStyle.Render("  ─  ") +
-			labelStyle.Render("DuckLake Snapshots") + mutedStyle.Render("  v0.1.0"),
+			labelStyle.Render("DuckLake Snapshots") + mutedStyle.Render("  "+versionLabel()),
 	)
 	divider := mutedStyle.Render(strings.Repeat("─", m.width))
 	header := lipgloss.JoinVertical(lipgloss.Left,
@@ -1279,7 +1279,7 @@ func (m Model) viewSnapshotsScreen() string {
 func (m Model) viewAuthScreen() string {
 	titleBar := headerBarStyle.Width(m.width).Render(
 		titleStyle.Render("🦆 Pintail") + mutedStyle.Render("  ─  ") +
-			labelStyle.Render("Auth Policy Editor") + mutedStyle.Render("  v0.1.0"),
+			labelStyle.Render("Auth Policy Editor") + mutedStyle.Render("  "+versionLabel()),
 	)
 	divider := mutedStyle.Render(strings.Repeat("─", m.width))
 	header := lipgloss.JoinVertical(lipgloss.Left, titleBar, divider)
@@ -1317,7 +1317,7 @@ func (m Model) viewAuthScreen() string {
 func (m Model) viewTLSScreen() string {
 	titleBar := headerBarStyle.Width(m.width).Render(
 		titleStyle.Render("🦆 Pintail") + mutedStyle.Render("  ─  ") +
-			labelStyle.Render("TLS Config Generator") + mutedStyle.Render("  v0.1.0"),
+			labelStyle.Render("TLS Config Generator") + mutedStyle.Render("  "+versionLabel()),
 	)
 	divider := mutedStyle.Render(strings.Repeat("─", m.width))
 	header := lipgloss.JoinVertical(lipgloss.Left, titleBar, divider)
@@ -1430,7 +1430,7 @@ func (m Model) viewTokenManager() string {
 func (m Model) viewTokenHeader() string {
 	titleBar := headerBarStyle.Width(m.width).Render(
 		titleStyle.Render("🦆 Pintail") + mutedStyle.Render("  ─  ") +
-			labelStyle.Render("Token Manager") + mutedStyle.Render("  v0.1.0"),
+			labelStyle.Render("Token Manager") + mutedStyle.Render("  "+versionLabel()),
 	)
 	activeTokens := 0
 	for _, t := range m.tokenMgr.tokens {
@@ -1456,7 +1456,7 @@ func (m Model) viewTokenFooter() string {
 func (m Model) viewScratchpadScreen() string {
 	titleBar := headerBarStyle.Width(m.width).Render(
 		titleStyle.Render("🦆 Pintail") + mutedStyle.Render("  ─  ") +
-			labelStyle.Render("SQL Scratchpad") + mutedStyle.Render("  v0.1.0"),
+			labelStyle.Render("SQL Scratchpad") + mutedStyle.Render("  "+versionLabel()),
 	)
 	divider := mutedStyle.Render(strings.Repeat("─", m.width))
 	header := lipgloss.JoinVertical(lipgloss.Left, titleBar, divider)

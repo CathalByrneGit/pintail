@@ -19,6 +19,7 @@ import (
 //   pintail ping <name>            Ping one connection by name.
 //   pintail query <name> "<sql>"   Execute SQL against one connection.
 //                                   Append --json for machine-readable output.
+//   pintail version                Print the version.
 //   pintail help                   Show this help.
 
 func main() {
@@ -52,6 +53,9 @@ func runSubcommand(args []string) error {
 			return fmt.Errorf("usage: pintail query <name> \"<sql>\" [--json]")
 		}
 		return cmdQuery(args[1], args[2], hasFlag(args, "--json"))
+	case "version", "-v", "--version":
+		fmt.Println("pintail " + versionLabel())
+		return nil
 	case "help", "-h", "--help":
 		printHelp()
 		return nil
@@ -227,6 +231,7 @@ Usage:
   pintail ping <name> [--json]     Ping one connection.
   pintail query <name> "<sql>" [--json]
                                     Execute SQL against one connection.
+  pintail version                  Print the version.
   pintail help                     Show this help.
 
 Connection types (set in the TUI's "Add Connection" screen):
