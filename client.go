@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -369,7 +370,14 @@ func buildCatalogAttach(catCfg ServerConfig) string {
 
 // ToServerInfo converts a ServerConfig into the display-oriented ServerInfo type.
 func (c ServerConfig) ToServerInfo() ServerInfo {
-	return ServerInfo{Name: c.Name, Host: c.Host, Port: c.Port, TLS: c.TLS}
+	return ServerInfo{
+		Name: c.Name,
+		Type: c.Type,
+		URI:  c.DisplayURI(),
+		Host: c.Host,
+		Port: c.Port,
+		TLS:  c.TLS,
+	}
 }
 
 // ── conn state ────────────────────────────────────────────────────────────
@@ -392,11 +400,12 @@ type pingResultMsg struct {
 	err     error
 }
 
-// queryResultMsg is sent on the Bubble Tea bus when a query completes.
+// queryResultMsg is sent on the Bubble Tea bus when a query completes. The
+// result always carries its own error (in QueryResult.Err), so there is no
+// separate error field, and no isMock flag now that the fabricated executor is
+// gone.
 type queryResultMsg struct {
 	result *QueryResult
-	isMock bool
-	errStr string
 }
 
 // pingServerCmd launches an async TCP ping for client[idx].
@@ -589,72 +598,113 @@ func (c *QuackClient) pingDuckLakeFile(path string, start time.Time) (time.Durat
 
 // ── query routing ─────────────────────────────────────────────────────────
 
-// QueryAsync returns a tea.Cmd that runs the query in a goroutine and
-// delivers a queryResultMsg back to the update loop.
-func (c *QuackClient) QueryAsync(sql string, fallbackSrv ServerInfo) tea.Cmd {
-	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
+// defaultQueryTimeout bounds a single scratchpad or CLI query. An admin check
+// against a cold object store can legitimately take a while, so it is
+// overridable rather than a hardcoded 30s.
+const defaultQueryTimeout = 30 * time.Second
 
-		state := c.GetState()
-		start := time.Now()
-
-		if !state.Online {
-			// Offline — surface a clear error rather than fabricating data.
-			// mockExecute is now a stub that returns an "offline / see README" Err.
-			r := mockExecute(sql, fallbackSrv)
-			r.ElapsedMs = int(time.Since(start).Milliseconds())
-			r.Method = "offline"
-			return queryResultMsg{result: &r, isMock: false}
+// QueryTimeout is the per-query deadline, overridable with
+// PINTAIL_QUERY_TIMEOUT (seconds). An unparseable or non-positive value falls
+// back to the default rather than disabling the deadline.
+func QueryTimeout() time.Duration {
+	if v := os.Getenv("PINTAIL_QUERY_TIMEOUT"); v != "" {
+		if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
+			return time.Duration(secs) * time.Second
 		}
-
-		done := func(r *QueryResult, method string) tea.Msg {
-			r.ElapsedMs = int(time.Since(start).Milliseconds())
-			r.Method = method
-			return queryResultMsg{result: r}
-		}
-		fail := func(method, msg string) tea.Msg {
-			return queryResultMsg{result: &QueryResult{
-				Query:     sql,
-				Err:       msg,
-				Timestamp: time.Now(),
-				ElapsedMs: int(time.Since(start).Milliseconds()),
-				Method:    method,
-			}}
-		}
-
-		// Only Quack remotes have a host:port to POST to. For local files and
-		// DuckLake the CLI is the one and only path, so a CLI failure IS the
-		// answer: falling through to HTTP dialed http://:0 and replaced the
-		// real DuckDB error with "no endpoint responded", which is what the
-		// user then had to debug.
-		overHTTP := c.Config.Type == ConnQuack
-
-		var errs []string
-		method := "cli"
-
-		if c.hasCLI {
-			r, err := c.queryCLI(ctx, sql)
-			if err == nil {
-				return done(r, "cli")
-			}
-			errs = append(errs, err.Error())
-		} else if !overHTTP {
-			return fail("cli", fmt.Sprintf(
-				"duckdb CLI not found in PATH — required for %s connections", c.Config.Type))
-		}
-
-		if overHTTP {
-			method = "http"
-			r, err := c.queryHTTP(ctx, sql)
-			if err == nil {
-				return done(r, "http")
-			}
-			errs = append(errs, err.Error())
-		}
-
-		return fail(method, strings.Join(errs, "; "))
 	}
+	return defaultQueryTimeout
+}
+
+// QueryAsync returns a tea.Cmd that runs the query in a goroutine and delivers
+// a queryResultMsg back to the update loop. Cancelling ctx aborts the query —
+// the CLI subprocess is killed with it — which is what makes ctrl+c in the
+// scratchpad able to interrupt a long-running statement.
+func (c *QuackClient) QueryAsync(ctx context.Context, sql string) tea.Cmd {
+	return func() tea.Msg {
+		return queryResultMsg{result: c.Query(ctx, sql)}
+	}
+}
+
+// Query runs sql and always returns a result: failures come back with Err set
+// rather than as a Go error, so every caller reports them the same way. Both
+// the TUI and the `pintail query` subcommand go through here, which is why the
+// CLI can now reach a Quack server over HTTP without a duckdb binary.
+func (c *QuackClient) Query(ctx context.Context, sql string) *QueryResult {
+	state := c.GetState()
+	start := time.Now()
+
+	if !state.Online {
+		// Offline — surface a clear error rather than fabricating data.
+		r := offlineResult(sql)
+		r.ElapsedMs = int(time.Since(start).Milliseconds())
+		return &r
+	}
+
+	done := func(r *QueryResult, method string) *QueryResult {
+		r.ElapsedMs = int(time.Since(start).Milliseconds())
+		r.Method = method
+		return r
+	}
+	fail := func(method, msg string) *QueryResult {
+		return &QueryResult{
+			Query:     sql,
+			Err:       msg,
+			Timestamp: time.Now(),
+			ElapsedMs: int(time.Since(start).Milliseconds()),
+			Method:    method,
+		}
+	}
+
+	// Only Quack remotes have a host:port to POST to. For local files and
+	// DuckLake the CLI is the one and only path, so a CLI failure IS the
+	// answer: falling through to HTTP dialed http://:0 and replaced the
+	// real DuckDB error with "no endpoint responded", which is what the
+	// user then had to debug.
+	overHTTP := c.Config.Type == ConnQuack
+
+	var errs []string
+	method := "cli"
+
+	if c.hasCLI {
+		r, err := c.queryCLI(ctx, sql)
+		if err == nil {
+			return done(r, "cli")
+		}
+		// A cancelled or timed-out query is not a SQL failure; say which.
+		if ctxErr := ctxReason(ctx); ctxErr != "" {
+			return fail("cli", ctxErr)
+		}
+		errs = append(errs, err.Error())
+	} else if !overHTTP {
+		return fail("cli", fmt.Sprintf(
+			"duckdb CLI not found in PATH — required for %s connections", c.Config.Type))
+	}
+
+	if overHTTP {
+		method = "http"
+		r, err := c.queryHTTP(ctx, sql)
+		if err == nil {
+			return done(r, "http")
+		}
+		if ctxErr := ctxReason(ctx); ctxErr != "" {
+			return fail("http", ctxErr)
+		}
+		errs = append(errs, err.Error())
+	}
+
+	return fail(method, strings.Join(errs, "; "))
+}
+
+// ctxReason turns a finished context into the reason a query stopped, or ""
+// when the context is still live and the failure was the query's own.
+func ctxReason(ctx context.Context) string {
+	switch ctx.Err() {
+	case context.Canceled:
+		return "cancelled"
+	case context.DeadlineExceeded:
+		return fmt.Sprintf("timed out after %s", QueryTimeout())
+	}
+	return ""
 }
 
 // cliArgs builds the duckdb argv for a script.

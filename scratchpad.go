@@ -14,6 +14,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // ── types ─────────────────────────────────────────────────────────────────
@@ -30,9 +31,13 @@ type Scratchpad struct {
 	servers   []ServerInfo
 	serverIdx int
 
-	clients []*QuackClient // may be nil entries or nil slice for mock-only mode
+	clients []*QuackClient // may be nil entries or nil slice when unconfigured
 	running bool           // true while an async query is in flight
-	isMock  bool           // true when last result came from the mock executor
+
+	// cancelQuery aborts the in-flight query, killing the duckdb subprocess
+	// with it. Without this the only way out of a slow query was to kill the
+	// whole app, since ctrl+c quits.
+	cancelQuery context.CancelFunc
 
 	// Export prompt state: when true, the next key is treated as a format
 	// selection (c=CSV, p=Parquet, anything else cancels).
@@ -52,7 +57,7 @@ type QueryResult struct {
 	ElapsedMs int
 	Timestamp time.Time
 	Err       string
-	Method    string // "cli" | "http" | "mock"
+	Method    string // "cli" | "http" | "offline"
 }
 
 // HistoryEntry records a completed query.
@@ -151,12 +156,8 @@ func (sp Scratchpad) Update(msg tea.Msg) (Scratchpad, tea.Cmd) {
 	// ── async query result ────────────────────────────────────────────────
 	case queryResultMsg:
 		sp.running = false
-		if msg.errStr != "" {
-			sp.result = &QueryResult{Err: msg.errStr, Query: "", Timestamp: time.Now(), Method: "error"}
-		} else {
-			sp.result = msg.result
-			sp.isMock = msg.isMock
-		}
+		sp.cancelQuery = nil
+		sp.result = msg.result
 		if sp.result != nil {
 			sp.resultsVP.SetContent(renderResultTable(*sp.result, sp.resultsVP.Width-4))
 			sp.resultsVP.GotoTop()
@@ -213,6 +214,12 @@ func (sp Scratchpad) Update(msg tea.Msg) (Scratchpad, tea.Cmd) {
 			sp.exportMsg = ""
 			return sp.runQuery()
 
+		// Interrupt an in-flight query. ctrl+c is the psql convention and is
+		// routed here by the root model while a query is running; esc does the
+		// same so there is a way out that doesn't risk quitting the app.
+		case "ctrl+c", "esc":
+			return sp.cancel(), nil
+
 		case "ctrl+e":
 			if sp.result != nil && !sp.result.IsEmpty() {
 				sp.exportPrompt = true
@@ -227,7 +234,6 @@ func (sp Scratchpad) Update(msg tea.Msg) (Scratchpad, tea.Cmd) {
 
 		case "ctrl+l":
 			sp.result = nil
-			sp.isMock = false
 			sp.resultsVP.SetContent("")
 			return sp, nil
 
@@ -295,8 +301,7 @@ func (sp Scratchpad) runQuery() (Scratchpad, tea.Cmd) {
 		return sp, nil
 	}
 
-	srv, ok := sp.target()
-	if !ok {
+	if _, ok := sp.target(); !ok {
 		return sp, func() tea.Msg {
 			return queryResultMsg{result: &QueryResult{
 				Query:     sql,
@@ -307,25 +312,43 @@ func (sp Scratchpad) runQuery() (Scratchpad, tea.Cmd) {
 		}
 	}
 
-	sp.running = true
-
 	// Resolve the right client for the selected server
 	var client *QuackClient
 	if sp.clients != nil && sp.serverIdx < len(sp.clients) {
 		client = sp.clients[sp.serverIdx]
 	}
 
-	// Async: run in a goroutine, result comes back as queryResultMsg
-	if client != nil {
-		return sp, client.QueryAsync(sql, srv)
+	// No client at all — return an offline result rather than fabricating.
+	if client == nil {
+		return sp, func() tea.Msg {
+			r := offlineResult(sql)
+			return queryResultMsg{result: &r}
+		}
 	}
 
-	// No client at all — return an offline result rather than fabricating.
-	return sp, func() tea.Msg {
-		r := mockExecute(sql, srv)
-		r.Method = "offline"
-		return queryResultMsg{result: &r, isMock: false}
+	sp.running = true
+
+	// The cancel func is kept so ctrl+c / esc can abort this query; the
+	// deadline still applies on top of it.
+	ctx, cancel := context.WithTimeout(context.Background(), QueryTimeout())
+	sp.cancelQuery = cancel
+
+	// Async: run in a goroutine, result comes back as queryResultMsg
+	return sp, client.QueryAsync(ctx, sql)
+}
+
+// Running reports whether a query is in flight, so the root model knows whether
+// ctrl+c means "interrupt the query" or "quit the app".
+func (sp Scratchpad) Running() bool { return sp.running }
+
+// cancel aborts an in-flight query. The result message still arrives, carrying
+// the reason, so the status line updates through the normal path.
+func (sp Scratchpad) cancel() Scratchpad {
+	if sp.cancelQuery != nil {
+		sp.cancelQuery()
+		sp.cancelQuery = nil
 	}
+	return sp
 }
 
 func (sp Scratchpad) historyPrev() Scratchpad {
@@ -368,16 +391,30 @@ func (sp Scratchpad) ViewEditor() string {
 			sp.editor.View(),
 		)
 	}
-	scheme := "quack://"
-	badge := amberStyle.Render("● HTTP")
-	if srv.TLS {
-		scheme = "quacks://"
-		badge = greenStyle.Render("● HTTPS")
+	// Describe the target as what it actually is. Only a Quack remote has a
+	// transport to report; a local file or a lake has neither scheme nor TLS.
+	uri := srv.URI
+	var badge string
+	switch srv.Type {
+	case ConnQuack:
+		if uri == "" {
+			uri = "quack://" + srv.Host + fmt.Sprintf(":%d", srv.Port)
+		}
+		if srv.TLS {
+			badge = greenStyle.Render("● HTTPS")
+		} else {
+			badge = amberStyle.Render("● HTTP")
+		}
+	case ConnLocal:
+		badge = mutedStyle.Render("● file")
+	case ConnDuckLake:
+		badge = mutedStyle.Render("● ducklake")
 	}
+
 	serverLine := "  " +
 		mutedStyle.Render("target  ") +
 		labelStyle.Render(srv.Name) +
-		mutedStyle.Render("  "+scheme+srv.Host+fmt.Sprintf(":%d", srv.Port)+"  ") +
+		mutedStyle.Render("  "+truncate(uri, 60)+"  ") +
 		badge
 
 	histLine := ""
@@ -411,7 +448,7 @@ func (sp Scratchpad) ViewResultsStatus() string {
 	}
 	if sp.running {
 		return "  " + amberStyle.Render("⟳ running…") +
-			mutedStyle.Render("  query in flight")
+			mutedStyle.Render("  ctrl+c or esc to interrupt  ·  deadline "+QueryTimeout().String())
 	}
 	if sp.result == nil {
 		return mutedStyle.Render("  no results yet — press ctrl+r to run")
@@ -425,28 +462,28 @@ func (sp Scratchpad) ViewResultsStatus() string {
 		rowWord = "row"
 	}
 
-	// Source badge
+	// Where the result came from. There is no "mock" case any more: the
+	// fabricated executor is gone, so a result is either live or an error.
 	var badge string
 	switch sp.result.Method {
 	case "cli":
 		badge = greenStyle.Render("● LIVE/cli")
 	case "http":
 		badge = greenStyle.Render("● LIVE/http")
-	case "mock":
-		badge = amberStyle.Render("◌ MOCK")
 	default:
-		badge = mutedStyle.Render("◌ mock")
+		badge = mutedStyle.Render("◌ " + sp.result.Method)
 	}
 
-	// CLI availability hint when offline
+	// When the selected connection can't run queries, say which prerequisite is
+	// missing rather than leaving the user to guess.
 	var cliHint string
-	if sp.isMock {
-		if sp.clients != nil && sp.serverIdx < len(sp.clients) && sp.clients[sp.serverIdx] != nil {
-			if !sp.clients[sp.serverIdx].HasCLI() {
-				cliHint = mutedStyle.Render("  ·  install duckdb CLI for live queries")
-			} else {
-				cliHint = mutedStyle.Render("  ·  server offline")
-			}
+	if sp.clients != nil && sp.serverIdx < len(sp.clients) && sp.clients[sp.serverIdx] != nil {
+		c := sp.clients[sp.serverIdx]
+		switch {
+		case !c.GetState().Online:
+			cliHint = mutedStyle.Render("  ·  connection offline")
+		case !c.HasCLI() && c.Config.Type != ConnQuack:
+			cliHint = mutedStyle.Render("  ·  install the duckdb CLI for live queries")
 		}
 	}
 
@@ -506,6 +543,7 @@ func (sp Scratchpad) viewEmptyResults() string {
 func (sp Scratchpad) ViewFooter() string {
 	keys := strings.Join([]string{
 		keyBadge("ctrl+r") + " run",
+		keyBadge("ctrl+c") + " interrupt",
 		keyBadge("ctrl+p/n") + " history",
 		keyBadge("ctrl+e") + " export",
 		keyBadge("ctrl+b/f") + " page  " + keyBadge("ctrl+u/d") + " ½page  " + keyBadge("alt+↑↓") + " line",
@@ -530,27 +568,34 @@ func renderResultTable(r QueryResult, maxWidth int) string {
 		return mutedStyle.Render("(0 rows)")
 	}
 
-	// Calculate column widths
+	// Column widths in terminal cells, so wide characters line up.
 	widths := make([]int, len(r.Columns))
 	for i, c := range r.Columns {
-		widths[i] = len(c)
+		widths[i] = ansi.StringWidth(c)
 	}
 	for _, row := range r.Rows {
 		for j, cell := range row {
-			if j < len(widths) && len(cell) > widths[j] {
-				widths[j] = len(cell)
+			if j < len(widths) {
+				if w := ansi.StringWidth(cell); w > widths[j] {
+					widths[j] = w
+				}
 			}
 		}
 	}
 
-	// Cap total width: trim last columns if necessary
+	// Cap total width: trim trailing columns if necessary, and count how many
+	// were dropped. Dropping them silently meant a wide result looked complete
+	// while columns were missing off the right-hand edge.
 	sep := "  │  "
-	total := sum(widths) + (len(widths)-1)*len(sep)
+	sepW := ansi.StringWidth(sep)
+	allColumns := len(r.Columns)
+	total := sum(widths) + (len(widths)-1)*sepW
 	for total > maxWidth && len(widths) > 1 {
 		widths = widths[:len(widths)-1]
 		r.Columns = r.Columns[:len(r.Columns)-1]
-		total = sum(widths) + (len(widths)-1)*len(sep)
+		total = sum(widths) + (len(widths)-1)*sepW
 	}
+	dropped := allColumns - len(r.Columns)
 
 	var sb strings.Builder
 
@@ -587,53 +632,71 @@ func renderResultTable(r QueryResult, maxWidth int) string {
 		sb.WriteString("\n")
 	}
 
+	if dropped > 0 {
+		noun := "columns"
+		if dropped == 1 {
+			noun = "column"
+		}
+		sb.WriteString("\n")
+		sb.WriteString(amberStyle.Render(fmt.Sprintf("+ %d more %s", dropped, noun)))
+		sb.WriteString(mutedStyle.Render(" — too wide for this terminal; SELECT fewer columns to see them"))
+		sb.WriteString("\n")
+	}
+
 	return sb.String()
 }
 
-// ── offline stub (no mock data) ─────────────────────────────────────────
+// ── offline result ────────────────────────────────────────────────────────
 //
-// Earlier versions of Pintail had a fabricated mock executor that returned
-// fake demo rows for queries like "SELECT * FROM analytics.orders" when no
-// real connection was available. That was confusing — the dashboard looked
-// populated, the scratchpad returned results, but none of it was real.
-// The honest behaviour is to surface the offline state and direct the user
-// at the README "Getting started" section.
+// Earlier versions had a mock executor that returned fake demo rows when no
+// real connection was available. That was confusing — the scratchpad returned
+// results and none of them were real. What replaced it is this: say the
+// connection is offline and point at the README. (It was still called
+// mockExecute, and took a ServerInfo it ignored, until the last of the mock
+// scaffolding went.)
 
-func mockExecute(query string, srv ServerInfo) QueryResult {
+func offlineResult(query string) QueryResult {
 	return QueryResult{
 		Query:     query,
 		Timestamp: time.Now(),
+		Method:    "offline",
 		Err:       "no online connection — start a Quack server, point at a .duckdb file, or attach a DuckLake (see README \"Getting started\")",
 	}
 }
 
+// padRight pads s with spaces to w terminal cells.
+//
+// Width is measured in cells, not bytes: a CJK character occupies two cells and
+// three bytes, and a styled string carries escape sequences that occupy none.
+// Measuring bytes made every column containing either one misalign.
 func padRight(s string, w int) string {
-	if len(s) >= w {
+	gap := w - ansi.StringWidth(s)
+	if gap <= 0 {
 		return s
 	}
-	return s + strings.Repeat(" ", w-len(s))
+	return s + strings.Repeat(" ", gap)
 }
 
-// truncate shortens s to at most n characters, marking the cut with an
-// ellipsis when there's room for one. n <= 0 means "no room at all" and
-// yields the empty string — callers derive n from panel widths, which go
-// negative on narrow terminals, and returning the untruncated string there
-// blew the layout apart.
+// truncate shortens s to at most n terminal cells, marking the cut with an
+// ellipsis when there's room for one. n <= 0 means "no room at all" and yields
+// the empty string — callers derive n from panel widths, which go negative on
+// narrow terminals, and returning the untruncated string there blew the layout
+// apart.
 //
-// Cuts land on rune boundaries; slicing bytes used to emit invalid UTF-8 for
-// multibyte content (query results, client_context, snapshot fields).
+// Cutting is ANSI- and width-aware: slicing bytes used to emit invalid UTF-8
+// for multibyte content and could sever an escape sequence mid-way, leaving the
+// rest of the line coloured by whatever the fragment happened to say.
 func truncate(s string, n int) string {
 	if n <= 0 {
 		return ""
 	}
-	r := []rune(s)
-	if len(r) <= n {
+	if ansi.StringWidth(s) <= n {
 		return s
 	}
-	if n <= 3 {
-		return string(r[:n])
+	if n <= 1 {
+		return ansi.Truncate(s, n, "")
 	}
-	return string(r[:n-1]) + "…"
+	return ansi.Truncate(s, n, "…")
 }
 
 func firstLine(s string) string {

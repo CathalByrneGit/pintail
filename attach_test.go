@@ -251,7 +251,7 @@ func TestLocalWithSecretQueriesAgainstRealDuckDB(t *testing.T) {
 		t.Fatalf("ping: %v", err)
 	}
 
-	msg := c.QueryAsync("SELECT answer FROM t;", cfg.ToServerInfo())().(queryResultMsg)
+	msg := c.QueryAsync(context.Background(), "SELECT answer FROM t;")().(queryResultMsg)
 
 	// A storage secret needs the httpfs extension, which duckdb downloads on
 	// first use. Where that download is blocked the prologue cannot complete —
@@ -268,7 +268,7 @@ func TestLocalWithSecretQueriesAgainstRealDuckDB(t *testing.T) {
 	}
 
 	// And the secret really was created in that session.
-	verify := c.QueryAsync("SELECT name FROM duckdb_secrets();", cfg.ToServerInfo())().(queryResultMsg)
+	verify := c.QueryAsync(context.Background(), "SELECT name FROM duckdb_secrets();")().(queryResultMsg)
 	if verify.result.Err != "" {
 		t.Fatalf("duckdb_secrets query failed: %s", verify.result.Err)
 	}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -145,7 +146,7 @@ func TestQueryAsyncErrorReporting(t *testing.T) {
 			c.state = ConnState{Online: tc.online, ErrMsg: "forced by test"}
 			c.hasCLI = false
 
-			msg, isQuery := c.QueryAsync("SELECT 1;", tc.cfg.ToServerInfo())().(queryResultMsg)
+			msg, isQuery := c.QueryAsync(context.Background(), "SELECT 1;")().(queryResultMsg)
 			if !isQuery {
 				t.Fatalf("QueryAsync returned %T, want queryResultMsg", msg)
 			}

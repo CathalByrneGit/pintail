@@ -22,8 +22,14 @@ type Connection struct {
 
 // ServerInfo is the display-oriented view of a server, derived from a
 // ServerConfig. Live status (latency, online) lives in QuackClient.ConnState.
+//
+// Type and URI are carried here because without them the scratchpad had only
+// Host/Port to work from and rendered every target as quack://host:port —
+// including local files, which showed up as the nonsensical "quack://:0".
 type ServerInfo struct {
 	Name string
+	Type ConnType
+	URI  string // as ServerConfig.DisplayURI() renders it
 	Host string
 	Port int
 	TLS  bool

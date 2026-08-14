@@ -140,7 +140,7 @@ func TestMetadataQueriesAgainstRealDuckDB(t *testing.T) {
 	})
 
 	t.Run("queries surface real errors", func(t *testing.T) {
-		msg, ok := c.QueryAsync("SELECT no_such_column FROM analytics.orders;", cfg.ToServerInfo())().(queryResultMsg)
+		msg, ok := c.QueryAsync(context.Background(), "SELECT no_such_column FROM analytics.orders;")().(queryResultMsg)
 		if !ok {
 			t.Fatal("QueryAsync returned the wrong message type")
 		}
@@ -157,7 +157,7 @@ func TestMetadataQueriesAgainstRealDuckDB(t *testing.T) {
 	})
 
 	t.Run("successful query returns rows", func(t *testing.T) {
-		msg := c.QueryAsync("SELECT id FROM analytics.orders ORDER BY id LIMIT 3;", cfg.ToServerInfo())().(queryResultMsg)
+		msg := c.QueryAsync(context.Background(), "SELECT id FROM analytics.orders ORDER BY id LIMIT 3;")().(queryResultMsg)
 		if msg.result.Err != "" {
 			t.Fatalf("unexpected error: %s", msg.result.Err)
 		}

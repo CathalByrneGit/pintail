@@ -298,6 +298,22 @@ returned, plus two ready-to-paste SQL blocks:
 Neither is run from this screen by design; you copy the SQL into the
 scratchpad (or your tool of choice) to actually execute.
 
+### Running queries
+
+`ctrl+r` runs the buffer against the selected target. While a query is in
+flight, `ctrl+c` (the psql convention) or `esc` interrupts it — the `duckdb`
+subprocess is killed with it — instead of the only escape being to kill
+Pintail. Each query also has a deadline, 30s by default and overridable:
+
+```bash
+PINTAIL_QUERY_TIMEOUT=120 pintail    # seconds
+```
+
+Results are rendered to fit the terminal. Columns that don't fit are dropped
+from the right and the count is reported under the table (`+ 2 more columns`),
+so a wide result never looks complete when it isn't. Column widths are measured
+in terminal cells, so CJK text and emoji line up.
+
 ### Scratchpad export
 
 After running a query, `ctrl+e` opens an export prompt: `c` writes CSV
@@ -315,6 +331,12 @@ the list: `e` edits the selected entry, `d` deletes it (last-remaining
 deletion is blocked to prevent lockout), `→` returns to the form. Any
 save/delete rebuilds all in-memory clients so DuckLake `catalog_ref`
 lookups always see the latest state.
+
+Saving is refused, with the reason shown under the form, when a name is
+already taken (names are how `catalog_ref`, the CLI subcommands and the
+scratchpad target list find a connection, so duplicates make the second one
+unreachable), when a `catalog_ref` or `storage_secret_ref` names something
+that doesn't exist, or when a DuckLake names itself as its own catalog.
 
 ## CLI subcommands
 
@@ -334,8 +356,10 @@ pintail version                    # print the version
 pintail help
 ```
 
-`query` requires `duckdb` on `$PATH` and uses the same type-aware
-routing as the scratchpad — including `catalog_ref` resolution.
+`query` uses the same type-aware routing as the scratchpad — including
+`catalog_ref` resolution and storage secrets. A `quack` connection is reachable
+over HTTP without a `duckdb` binary; `local` and `ducklake` connections need
+the CLI, and say so if it's missing.
 
 ## Polling cadence
 
@@ -422,6 +446,11 @@ directory `0700`: it holds bearer tokens and cloud credentials in plaintext.
 Saving one section re-reads the file first, so a token edit cannot drop a
 connection you added in the meantime.
 
+### Environment
+
+- `PINTAIL_QUERY_TIMEOUT` — per-query deadline in seconds (default 30). Values
+  that aren't a positive integer are ignored.
+
 Other files written under `~/.duckdb/`:
 
 - `pintail_tokens.sql` — exported `CREATE SECRET` statements for Quack tokens (`e` in tokens mode)
@@ -435,7 +464,7 @@ Other files written under `~/.duckdb/`:
 
 **Secrets manager (`t`):** `tab` switch mode<span></span>· in **Quack tokens** mode: `↑↓` select · `n` new · `r` rotate · `d` revoke · `v` reveal · `e` export · `esc` back<span></span>· in **Storage secrets** mode: `↑↓` select · `n` new · `d` delete · `v` reveal · `e` export · `←→` cycle secret type in form · `esc` back
 
-**SQL scratchpad:** `ctrl+r` run · `ctrl+p`/`ctrl+n` history · `ctrl+e` export · `pgup`/`pgdn` scroll · `ctrl+l` clear · `tab` cycle target · `esc` back
+**SQL scratchpad:** `ctrl+r` run · `ctrl+c`/`esc` interrupt a running query · `ctrl+p`/`ctrl+n` history · `ctrl+e` export · `pgup`/`pgdn` scroll · `ctrl+l` clear · `tab` cycle target · `esc` back
 
 **DuckLake snapshots:** `↑↓` select · `r` refresh · `tab` cycle lake (if many) · `esc` back
 

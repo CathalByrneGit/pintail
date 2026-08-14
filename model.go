@@ -81,6 +81,11 @@ type addServerForm struct {
 
 	// Index of currently-selected row in the connection list, for edit/delete.
 	listCursor int
+
+	// Why the last save attempt was refused, shown under the form. Enter used
+	// to do nothing at all when the form wasn't saveable, which looked like a
+	// broken key.
+	errMsg string
 }
 
 type formField struct {
@@ -261,7 +266,7 @@ func (f *addServerForm) toConfig() ServerConfig {
 
 // valid returns whether the form has the minimum required fields filled in.
 func (f *addServerForm) valid() bool {
-	if f.name == "" {
+	if strings.TrimSpace(f.name) == "" {
 		return false
 	}
 	switch f.connType {
@@ -272,6 +277,83 @@ func (f *addServerForm) valid() bool {
 	default:
 		return f.host != ""
 	}
+}
+
+// problem returns the reason this form cannot be saved, or "" when it can.
+//
+// Beyond required fields, this catches the references that used to be accepted
+// and then failed silently at query time: a duplicate name (name lookup finds
+// the first match, so the second connection is unreachable by catalog_ref, the
+// CLI subcommands, and the scratchpad target list), a catalog_ref or
+// storage_secret_ref pointing at something that doesn't exist, and a DuckLake
+// naming itself as its own catalog.
+func (f *addServerForm) problem(configs []ServerConfig, secrets []StorageSecret) string {
+	name := strings.TrimSpace(f.name)
+	if name == "" {
+		return "name is required"
+	}
+
+	switch f.connType {
+	case ConnLocal:
+		if strings.TrimSpace(f.path) == "" {
+			return "path is required for a local connection"
+		}
+	case ConnDuckLake:
+		if strings.TrimSpace(f.storagePath) == "" {
+			return "storage path is required for a DuckLake connection"
+		}
+		if strings.TrimSpace(f.catalogPath) == "" && strings.TrimSpace(f.catalogRef) == "" {
+			return "a DuckLake connection needs either a catalog ref or a catalog path"
+		}
+	default:
+		if strings.TrimSpace(f.host) == "" {
+			return "host is required for a Quack connection"
+		}
+	}
+
+	for i, cfg := range configs {
+		if i == f.editingIdx {
+			continue // editing this one; its own name is not a clash
+		}
+		if strings.EqualFold(cfg.Name, name) {
+			return fmt.Sprintf("a connection named %q already exists", cfg.Name)
+		}
+	}
+
+	if ref := strings.TrimSpace(f.catalogRef); ref != "" && f.connType == ConnDuckLake {
+		if strings.EqualFold(ref, name) {
+			return "a DuckLake cannot be its own catalog"
+		}
+		if !hasConfigNamed(configs, ref) {
+			return fmt.Sprintf("no connection named %q to use as the catalog", ref)
+		}
+	}
+
+	if ref := strings.TrimSpace(f.secretRef); ref != "" {
+		if !hasSecretNamed(secrets, ref) {
+			return fmt.Sprintf("no storage secret named %q — create it on the tokens screen", ref)
+		}
+	}
+
+	return ""
+}
+
+func hasConfigNamed(configs []ServerConfig, name string) bool {
+	for _, cfg := range configs {
+		if cfg.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func hasSecretNamed(secrets []StorageSecret, name string) bool {
+	for _, s := range secrets {
+		if s.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // ── per-connection metadata ───────────────────────────────────────────────
@@ -589,6 +671,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c":
+			// While a query is in flight, ctrl+c interrupts it rather than
+			// quitting — the psql convention, and previously the only way to
+			// escape a slow query was to kill the whole app.
+			if m.currentView == viewScratchpad && m.scratchpad.Running() {
+				var spCmd tea.Cmd
+				m.scratchpad, spCmd = m.scratchpad.Update(msg)
+				return m, spCmd
+			}
 			return m, tea.Quit
 		}
 
@@ -678,6 +768,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case viewScratchpad:
 			if msg.String() == "esc" {
+				// esc cancels a running query before it leaves the screen, so
+				// there is an interrupt that carries no risk of quitting.
+				if m.scratchpad.Running() {
+					var spCmd tea.Cmd
+					m.scratchpad, spCmd = m.scratchpad.Update(msg)
+					return m, spCmd
+				}
 				m.currentView = viewDashboard
 				return m, nil
 			}
@@ -898,9 +995,11 @@ func (m Model) updateAddServer(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			f.focusIdx++
 			return m, nil
 		}
-		if !f.valid() {
+		if problem := f.problem(m.configs, m.storageSecrets); problem != "" {
+			f.errMsg = problem
 			return m, nil
 		}
+		f.errMsg = ""
 		cfg := f.toConfig()
 		if f.editingIdx >= 0 && f.editingIdx < len(m.configs) {
 			m.configs[f.editingIdx] = cfg
@@ -1308,6 +1407,11 @@ func (m Model) viewAddServerScreen() string {
 	}
 	if !f.valid() {
 		hint += "  " + redStyle.Render("· required fields missing")
+	}
+	// Why the last save was refused — a duplicate name or a reference that
+	// doesn't resolve, both of which used to be accepted and fail later.
+	if f.errMsg != "" {
+		hint += "\n  " + redStyle.Render("✕ "+f.errMsg)
 	}
 
 	// Existing connections panel (left)

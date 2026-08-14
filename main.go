@@ -168,11 +168,8 @@ func cmdQuery(name, sql string, asJSON bool) error {
 		return fmt.Errorf("no connection named %q", name)
 	}
 	c := NewQuackClient(cfg, makeResolver(), makeSecretResolver())
-	if !c.HasCLI() {
-		return fmt.Errorf("duckdb CLI not found in PATH (required for query subcommand)")
-	}
 
-	// Best-effort ping so we know which method to use
+	// Best-effort ping so the client knows whether it is online
 	pingCtx, pingCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	c.Ping(pingCtx)
 	pingCancel()
@@ -181,12 +178,15 @@ func cmdQuery(name, sql string, asJSON bool) error {
 		return fmt.Errorf("connection %q is offline (%s)", name, c.GetState().ErrMsg)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), QueryTimeout())
 	defer cancel()
 
-	result, err := c.queryCLI(ctx, sql)
-	if err != nil {
-		return err
+	// Same routing as the TUI, which is the point: a Quack server reachable
+	// over HTTP is queryable here without a duckdb binary. This used to reject
+	// the query outright unless the CLI was installed.
+	result := c.Query(ctx, sql)
+	if result.Err != "" {
+		return fmt.Errorf("%s", result.Err)
 	}
 
 	if asJSON {
