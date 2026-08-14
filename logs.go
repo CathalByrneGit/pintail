@@ -154,7 +154,7 @@ func (v LogsView) EnableCmd() tea.Cmd {
 // are dropped so the panel shows the server's traffic rather than the fact that
 // it is being watched.
 func parseLogRows(data []byte) ([]LogEntry, error) {
-	data = bytes.TrimSpace(data)
+	data = lastJSONArray(bytes.TrimSpace(data))
 	if len(data) == 0 || string(data) == "[]" {
 		return nil, nil
 	}

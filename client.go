@@ -800,9 +800,40 @@ func (c *QuackClient) probeQuackHTTP(ctx context.Context) (confirmed bool, err e
 	return strings.Contains(string(body), "Quack RPC endpoint"), nil
 }
 
+// lastJSONArray returns the final top-level JSON array in duckdb's -json output.
+//
+// `duckdb -json -c` prints one array per statement that produces a result, and
+// every script Pintail sends is a prologue followed by the caller's statement.
+// Most prologue statements are silent — ATTACH, USE, SET, LOAD emit nothing —
+// but not all: CREATE SECRET emits [{"Success":true}], CHECKPOINT emits [].
+// When that happened the whole response failed to parse as a single array and
+// the query looked broken, which is what a storage secret on a connection did
+// to every result it returned.
+//
+// The caller's statement is always last, so the last array is the answer — and
+// the last array specifically, not the last non-empty one: a query that
+// legitimately returns no rows must not be reported as the prologue's output.
+func lastJSONArray(data []byte) []byte {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	var last []byte
+	for {
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
+			break
+		}
+		if trimmed := bytes.TrimSpace(raw); len(trimmed) > 0 && trimmed[0] == '[' {
+			last = trimmed
+		}
+	}
+	if last == nil {
+		return data // unparseable: hand it back so the caller can report it
+	}
+	return last
+}
+
 // parseJSONRows converts DuckDB's -json output (array of objects) to QueryResult.
 func parseJSONRows(query string, data []byte) (*QueryResult, error) {
-	data = bytes.TrimSpace(data)
+	data = lastJSONArray(bytes.TrimSpace(data))
 	if len(data) == 0 {
 		return &QueryResult{Query: query, Timestamp: time.Now()}, nil
 	}
@@ -952,7 +983,7 @@ func (c *QuackClient) fetchDuckLakeSnapshots(ctx context.Context, idx int) tea.M
 
 // parseDuckLakeSnapshots renders snapshots as "connections" for the dashboard.
 func parseDuckLakeSnapshots(data []byte, cfg ServerConfig) ([]Connection, error) {
-	data = bytes.TrimSpace(data)
+	data = lastJSONArray(bytes.TrimSpace(data))
 	if len(data) == 0 || string(data) == "[]" {
 		return nil, fmt.Errorf("no snapshots")
 	}
@@ -989,7 +1020,7 @@ func parseDuckLakeSnapshots(data []byte, cfg ServerConfig) ([]Connection, error)
 // catalog) are still honoured so a backend that reports them keeps working; the
 // second return carries a connection_count if one is present.
 func parseSessionRows(data []byte, cfg ServerConfig) ([]Connection, string, error) {
-	data = bytes.TrimSpace(data)
+	data = lastJSONArray(bytes.TrimSpace(data))
 	if len(data) == 0 || string(data) == "[]" {
 		return nil, "", fmt.Errorf("empty")
 	}
@@ -1121,7 +1152,7 @@ func (c *QuackClient) FetchCatalogCmd(idx int) tea.Cmd {
 }
 
 func parseCatalogRows(data []byte) ([]CatalogSchema, error) {
-	data = bytes.TrimSpace(data)
+	data = lastJSONArray(bytes.TrimSpace(data))
 	if len(data) == 0 || string(data) == "[]" {
 		return nil, fmt.Errorf("empty")
 	}

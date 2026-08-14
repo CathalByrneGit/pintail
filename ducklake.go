@@ -313,7 +313,7 @@ func fetchSnapshots(ctx context.Context, c *QuackClient) ([]Snapshot, error) {
 }
 
 func parseSnapshotRows(data []byte) ([]Snapshot, error) {
-	data = bytes.TrimSpace(data)
+	data = lastJSONArray(bytes.TrimSpace(data))
 	if len(data) == 0 || string(data) == "[]" {
 		return nil, nil
 	}

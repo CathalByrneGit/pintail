@@ -156,6 +156,23 @@ func TestMetadataQueriesAgainstRealDuckDB(t *testing.T) {
 		}
 	})
 
+	t.Run("a prologue statement that emits output does not break the result", func(t *testing.T) {
+		// This is what CI hit: with a storage secret in the prologue, CREATE
+		// SECRET printed its own [{"Success":true}] ahead of the query's rows.
+		// PRAGMA version stands in for it here — it emits a row array too, and
+		// needs no extension download.
+		r, err := c.queryCLI(context.Background(), "PRAGMA version; SELECT 42 AS answer;")
+		if err != nil {
+			t.Fatalf("multi-statement query failed: %v", err)
+		}
+		if len(r.Rows) != 1 || len(r.Columns) != 1 || r.Columns[0] != "answer" {
+			t.Fatalf("got columns %v rows %v, want the last statement's result", r.Columns, r.Rows)
+		}
+		if r.Rows[0][0] != "42" {
+			t.Errorf("row = %v, want 42", r.Rows[0])
+		}
+	})
+
 	t.Run("successful query returns rows", func(t *testing.T) {
 		msg := c.QueryAsync(context.Background(), "SELECT id FROM analytics.orders ORDER BY id LIMIT 3;")().(queryResultMsg)
 		if msg.result.Err != "" {
@@ -169,6 +186,102 @@ func TestMetadataQueriesAgainstRealDuckDB(t *testing.T) {
 		}
 		if msg.result.Rows[0][0] != "0" {
 			t.Errorf("first row = %v, want id 0", msg.result.Rows[0])
+		}
+	})
+}
+
+// `duckdb -json -c` prints one JSON array per statement that produces a result,
+// and every script Pintail sends is a prologue followed by the caller's
+// statement. A CREATE SECRET in that prologue emits [{"Success":true}] of its
+// own, which made the whole response unparseable — so every query on a
+// connection with a storage secret came back as "unexpected response".
+//
+// This is the exact output CI saw before the fix.
+func TestParserTakesTheLastStatementsOutput(t *testing.T) {
+	const twoArrays = `[{"Success":true}]
+[{"answer":42}]`
+
+	r, err := parseJSONRows("SELECT answer FROM t;", []byte(twoArrays))
+	if err != nil {
+		t.Fatalf("parseJSONRows: %v", err)
+	}
+	if len(r.Rows) != 1 || r.Rows[0][0] != "42" {
+		t.Fatalf("rows = %v, want the query's own result [[42]]", r.Rows)
+	}
+	if len(r.Columns) != 1 || r.Columns[0] != "answer" {
+		t.Errorf("columns = %v, want [answer]", r.Columns)
+	}
+}
+
+func TestLastJSONArray(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"single array is unchanged", `[{"a":1}]`, `[{"a":1}]`},
+		{"prologue output is skipped", "[{\"Success\":true}]\n[{\"a\":1}]", `[{"a":1}]`},
+		{"several prologue statements", "[]\n[{\"Success\":true}]\n[{\"a\":1}]", `[{"a":1}]`},
+		// The last array wins even when empty: a query returning no rows must
+		// not be reported as the prologue's output.
+		{"empty final result stays empty", "[{\"Success\":true}]\n[]", `[]`},
+		{"empty input", "", ""},
+		// Anything unparseable comes back untouched so the caller can report it.
+		{"not json", "Parser Error: syntax", "Parser Error: syntax"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := string(lastJSONArray([]byte(tc.in))); got != tc.want {
+				t.Errorf("lastJSONArray(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// The same multi-array output reaches every other parser, since they all read a
+// script with a prologue too.
+func TestAllParsersSkipPrologueOutput(t *testing.T) {
+	const prologue = "[{\"Success\":true}]\n"
+
+	t.Run("catalog", func(t *testing.T) {
+		got, err := parseCatalogRows([]byte(prologue +
+			`[{"table_schema":"main","table_name":"t","estimated_size":5,"object_type":"table"}]`))
+		if err != nil {
+			t.Fatalf("parseCatalogRows: %v", err)
+		}
+		if len(got) != 1 || got[0].Tables[0].Name != "t" {
+			t.Errorf("catalog = %+v", got)
+		}
+	})
+
+	t.Run("sessions", func(t *testing.T) {
+		conns, _, err := parseSessionRows([]byte(prologue+
+			`[{"connection_id":"c1","state":"active"}]`), ServerConfig{Name: "s"})
+		if err != nil {
+			t.Fatalf("parseSessionRows: %v", err)
+		}
+		if len(conns) != 1 || conns[0].ID != "c1" {
+			t.Errorf("conns = %+v", conns)
+		}
+	})
+
+	t.Run("snapshots", func(t *testing.T) {
+		snaps, err := parseSnapshotRows([]byte(prologue + `[{"snapshot_id":3,"schema_version":2}]`))
+		if err != nil {
+			t.Fatalf("parseSnapshotRows: %v", err)
+		}
+		if len(snaps) != 1 || snaps[0].ID != "3" {
+			t.Errorf("snapshots = %+v", snaps)
+		}
+	})
+
+	t.Run("logs", func(t *testing.T) {
+		entries, err := parseLogRows([]byte(prologue + `[{"message_type":"PREPARE_REQUEST","query":"SELECT 1"}]`))
+		if err != nil {
+			t.Fatalf("parseLogRows: %v", err)
+		}
+		if len(entries) != 1 || entries[0].MessageType != "PREPARE_REQUEST" {
+			t.Errorf("entries = %+v", entries)
 		}
 	})
 }
