@@ -36,11 +36,15 @@ type CatalogSchema struct {
 	Open   bool // whether the tree node is expanded in the UI
 }
 
-// CatalogTable is a physical table entry backed by object storage.
+// CatalogTable is one relation in the catalog.
 type CatalogTable struct {
 	Name   string
-	Format string // parquet | delta | iceberg
+	Format string // "table" | "view" — what the catalog reports it as
 	Rows   int64
+	// SizeKnown distinguishes "estimated at 0 rows" from "no estimate
+	// available" (views don't carry one), so the UI can stay silent instead of
+	// printing a row count the backend never gave us.
+	SizeKnown bool
 }
 
 // ── tick message ──────────────────────────────────────────────────────────

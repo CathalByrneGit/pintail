@@ -59,7 +59,7 @@ func TestParseSessionRows(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			conns, err := parseSessionRows([]byte(tc.json), cfg)
+			conns, _, err := parseSessionRows([]byte(tc.json), cfg)
 			if err != nil {
 				t.Fatalf("parseSessionRows: %v", err)
 			}
@@ -81,7 +81,7 @@ func TestParseSessionRows(t *testing.T) {
 
 func TestParseSessionRowsEmpty(t *testing.T) {
 	for _, in := range []string{"", "   ", "[]"} {
-		if _, err := parseSessionRows([]byte(in), ServerConfig{}); err == nil {
+		if _, _, err := parseSessionRows([]byte(in), ServerConfig{}); err == nil {
 			t.Errorf("parseSessionRows(%q): want error, got nil", in)
 		}
 	}

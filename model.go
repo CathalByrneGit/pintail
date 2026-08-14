@@ -297,6 +297,13 @@ type Model struct {
 	connTable   table.Model
 	tick        int
 
+	// Last error from each background fetch, shown in the panel it belongs to.
+	// Without these, a failing metadata query was indistinguishable from a
+	// backend that simply had nothing to report.
+	sessionErr    string
+	catalogErr    string
+	reportedConns string // connection count as reported by the backend
+
 	// token manager
 	tokenMgr TokenManager
 
@@ -439,17 +446,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	// ── live session results ───────────────────────────────────────────────
 	case sessionResultMsg:
-		if msg.err == nil && len(msg.connections) > 0 {
-			m.connections = msg.connections
-			m.connTable.SetRows(connectionRows(m.connections))
+		if msg.err != nil {
+			m.sessionErr = msg.err.Error()
+			return m, nil
 		}
+		// The result is applied even when it is empty, so rows that no longer
+		// exist stop being shown as though they were live.
+		m.sessionErr = ""
+		m.reportedConns = msg.reportedCount
+		m.connections = msg.connections
+		m.connTable.SetRows(connectionRows(m.connections))
 		return m, nil
 
 	// ── live catalog results ───────────────────────────────────────────────
 	case catalogResultMsg:
-		if msg.err == nil && len(msg.catalog) > 0 {
-			m.catalog = msg.catalog
+		if msg.err != nil {
+			m.catalogErr = msg.err.Error()
+			return m, nil
 		}
+		m.catalogErr = ""
+		m.catalog = msg.catalog
 		return m, nil
 
 	// ── data ticker ───────────────────────────────────────────────────────
@@ -919,10 +935,22 @@ func (m Model) viewHeader() string {
 }
 
 func (m Model) viewConnectionsPanel(width, height int) string {
-	content := lipgloss.JoinVertical(lipgloss.Left,
-		labelStyle.Render("ACTIVE CONNECTIONS"), "",
-		m.connTable.View(),
-	)
+	title := labelStyle.Render("ACTIVE CONNECTIONS")
+	if m.reportedConns != "" {
+		// DuckDB reports a count but cannot enumerate peers, so the count is
+		// labelled as the backend's rather than implied by the row count.
+		title += mutedStyle.Render("   backend reports " + m.reportedConns + " connection(s)")
+	}
+
+	rows := []string{title, ""}
+	if m.sessionErr != "" {
+		rows = append(rows,
+			redStyle.Render("✕ session query failed"),
+			mutedStyle.Render("  "+truncate(firstLine(m.sessionErr), width-6)),
+			"")
+	}
+	rows = append(rows, m.connTable.View())
+	content := lipgloss.JoinVertical(lipgloss.Left, rows...)
 	style := panelStyle
 	if m.focus == panelConnections {
 		style = activePanelStyle
@@ -935,14 +963,22 @@ func (m Model) viewCatalogPanel(width, height int) string {
 	lines = append(lines, labelStyle.Render("DUCKLAKE CATALOG"), "")
 
 	if len(m.catalog) == 0 {
-		lines = append(lines,
-			mutedStyle.Render("  ◌ no catalog data"),
-			"",
-			mutedStyle.Render("  populates from information_schema.tables"),
-			mutedStyle.Render("  when a connection comes online"),
-			"",
-			mutedStyle.Render("  see README §Getting started"),
-		)
+		if m.catalogErr != "" {
+			lines = append(lines,
+				redStyle.Render("  ✕ catalog query failed"),
+				"",
+				mutedStyle.Render("  "+truncate(firstLine(m.catalogErr), width-6)),
+			)
+		} else {
+			lines = append(lines,
+				mutedStyle.Render("  ◌ no catalog data"),
+				"",
+				mutedStyle.Render("  populates from duckdb_tables() / duckdb_views()"),
+				mutedStyle.Render("  when a connection comes online"),
+				"",
+				mutedStyle.Render("  see README §Getting started"),
+			)
+		}
 		style := panelStyle
 		if m.focus == panelCatalog {
 			style = activePanelStyle
@@ -962,11 +998,15 @@ func (m Model) viewCatalogPanel(width, height int) string {
 				if i == len(schema.Tables)-1 {
 					conn = "└─"
 				}
+				size := ""
+				if tbl.SizeKnown {
+					size = "  " + fmtRows(tbl.Rows)
+				}
 				lines = append(lines,
 					mutedStyle.Render("  "+conn+" ")+
 						brightStyle.Render(tbl.Name)+
 						mutedStyle.Render("  "+tbl.Format)+
-						mutedStyle.Render("  "+fmtRows(tbl.Rows)))
+						mutedStyle.Render(size))
 			}
 		}
 		lines = append(lines, "")

@@ -300,9 +300,9 @@ func fetchSnapshots(ctx context.Context, c *QuackClient) ([]Snapshot, error) {
 		return nil, fmt.Errorf("connection offline (%s)", state.ErrMsg)
 	}
 
-	// Since attachPrefix() already does `USE _lake`, the snapshots() function
-	// is resolved against the attached catalog (it's a method on _lake, not a
-	// standalone function — `ducklake_snapshots()` does not exist).
+	// snapshots() is a table macro DuckLake registers in the attached catalog's
+	// default schema; it expands to ducklake_snapshots('_lake'), so both
+	// spellings are valid once attachPrefix() has run ATTACH ... AS _lake.
 	sql := "SELECT * FROM _lake.snapshots() ORDER BY snapshot_id DESC LIMIT 50;"
 	script := c.attachPrefix() + sql
 

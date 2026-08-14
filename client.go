@@ -718,7 +718,11 @@ func parseJSONRows(query string, data []byte) (*QueryResult, error) {
 // sessionResultMsg is sent when a session poll completes.
 type sessionResultMsg struct {
 	connections []Connection
-	err         error
+	// reportedCount is the connection count the backend gave us, if any. It is
+	// carried separately from `connections` because DuckDB exposes a count but
+	// not a per-connection listing — the two are different facts.
+	reportedCount string
+	err           error
 }
 
 // FetchSessionsCmd polls the server for active connections via the CLI.
@@ -756,31 +760,55 @@ func (c *QuackClient) FetchSessionsCmd() tea.Cmd {
 	}
 }
 
+// fetchQuackSessions reports what the session is able to know about itself.
+//
+// This used to query duckdb_connections(), which does not exist in DuckDB —
+// the call failed with a Catalog Error on every poll, and the dropped error
+// left the panel looking merely empty. DuckDB exposes no per-connection
+// listing: current_connection_id(), session_user() and duckdb_connection_count()
+// are the whole surface, and metadata functions evaluate wherever the query
+// runs. So one row is reported — ours — with the backend's connection count
+// alongside it, rather than a fabricated list of peers.
+//
+// If a Quack server grows a real session-listing function, that is the right
+// source for this panel and this query should be replaced by it.
 func (c *QuackClient) fetchQuackSessions(ctx context.Context) tea.Msg {
-	sql := "SELECT connection_id, client_context, connected_since FROM duckdb_connections();"
+	sql := `SELECT current_connection_id() AS connection_id,
+	               session_user()          AS client_context,
+	               current_database()      AS catalog,
+	               (SELECT count FROM duckdb_connection_count()) AS connection_count;`
 	script := c.attachPrefix() + sql
 	cmd := exec.CommandContext(ctx, c.cliPath, "-json", "-c", script)
 	out, err := cmd.Output()
 	if err != nil {
-		return sessionResultMsg{err: fmt.Errorf("session query: %v", err)}
+		return sessionResultMsg{err: fmt.Errorf("session query: %s", cliError(err))}
 	}
-	conns, err := parseSessionRows(out, c.Config)
-	return sessionResultMsg{connections: conns, err: err}
+	conns, reported, err := parseSessionRows(out, c.Config)
+	return sessionResultMsg{connections: conns, reportedCount: reported, err: err}
+}
+
+// cliError prefers the subprocess's stderr over Go's bare "exit status 1",
+// which is what the fetch paths were surfacing (when they surfaced anything).
+func cliError(err error) string {
+	if ee, ok := err.(*exec.ExitError); ok && len(ee.Stderr) > 0 {
+		return strings.TrimSpace(string(ee.Stderr))
+	}
+	return err.Error()
 }
 
 func (c *QuackClient) fetchDuckLakeSnapshots(ctx context.Context) tea.Msg {
-	// The snapshots view is a method on the attached catalog, not a standalone
-	// function. After ATTACH ... AS _lake, the correct call is _lake.snapshots().
+	// snapshots() is a table macro DuckLake registers in the attached catalog's
+	// default schema, expanding to ducklake_snapshots('_lake'); either spelling
+	// works once ATTACH ... AS _lake has run.
 	sql := "SELECT snapshot_id, snapshot_time, schema_version FROM _lake.snapshots() ORDER BY snapshot_id DESC LIMIT 5;"
 	script := c.attachPrefix() + sql
 	cmd := exec.CommandContext(ctx, c.cliPath, "-json", "-c", script)
 	out, err := cmd.Output()
 	if err != nil {
-		// DuckLake metadata views may not be present yet — return a single placeholder
-		return sessionResultMsg{connections: []Connection{{
-			ID: "lake", IP: c.Config.CatalogPath, Identity: "ducklake",
-			Catalog: "_lake", Status: "active",
-		}}}
+		// Report the failure. This used to substitute a synthetic "lake" row,
+		// which made a missing ducklake extension or an unreachable catalog
+		// look like a healthy connection with one session.
+		return sessionResultMsg{err: fmt.Errorf("snapshot query: %s", cliError(err))}
 	}
 	conns, err := parseDuckLakeSnapshots(out, c.Config)
 	return sessionResultMsg{connections: conns, err: err}
@@ -818,16 +846,23 @@ func parseDuckLakeSnapshots(data []byte, cfg ServerConfig) ([]Connection, error)
 	return conns, nil
 }
 
-// parseSessionRows converts duckdb_connections() JSON output to []Connection.
-func parseSessionRows(data []byte, cfg ServerConfig) ([]Connection, error) {
+// parseSessionRows converts the session-facts JSON into []Connection. The
+// second return is the connection count the backend reported, verbatim and
+// possibly empty — the panel labels it rather than inventing a row per peer.
+func parseSessionRows(data []byte, cfg ServerConfig) ([]Connection, string, error) {
 	data = bytes.TrimSpace(data)
 	if len(data) == 0 || string(data) == "[]" {
-		return nil, fmt.Errorf("empty")
+		return nil, "", fmt.Errorf("empty")
 	}
 
 	var rows []map[string]interface{}
 	if err := json.Unmarshal(data, &rows); err != nil || len(rows) == 0 {
-		return nil, fmt.Errorf("parse error")
+		return nil, "", fmt.Errorf("parse error")
+	}
+
+	reportedCount := ""
+	if v, ok := rows[0]["connection_count"]; ok && v != nil {
+		reportedCount = fmt.Sprintf("%v", v)
 	}
 
 	conns := make([]Connection, 0, len(rows))
@@ -857,17 +892,24 @@ func parseSessionRows(data []byte, cfg ServerConfig) ([]Connection, error) {
 			}
 		}
 
+		catalog := "_remote"
+		if v, ok := row["catalog"]; ok && v != nil {
+			if s := cutRunes(fmt.Sprintf("%v", v), 12); s != "" {
+				catalog = s
+			}
+		}
+
 		conns = append(conns, Connection{
 			ID:       id,
 			IP:       cfg.Host,
 			Identity: identity,
-			Catalog:  "_remote",
+			Catalog:  catalog,
 			Duration: since,
 			Queries:  0,
 			Status:   "active",
 		})
 	}
-	return conns, nil
+	return conns, reportedCount, nil
 }
 
 // ── catalog fetch ─────────────────────────────────────────────────────────
@@ -890,9 +932,22 @@ func (c *QuackClient) FetchCatalogCmd() tea.Cmd {
 			return catalogResultMsg{err: fmt.Errorf("offline or no CLI")}
 		}
 
-		sql := `SELECT table_schema, table_name, estimated_size
-			    FROM information_schema.tables
-			    WHERE table_schema NOT IN ('information_schema','pg_catalog')
+		// information_schema.tables has no estimated_size column — selecting it
+		// failed with a Binder Error on every backend, and because the error was
+		// dropped by the update loop the catalog panel just stayed empty. Row
+		// counts live on duckdb_tables(); views have no size and come from
+		// duckdb_views(). Filtering on current_database() keeps the listing to
+		// the backend we attached, rather than also reporting the CLI's own
+		// in-memory database.
+		sql := `SELECT schema_name AS table_schema, table_name, estimated_size,
+			           'table' AS object_type
+			      FROM duckdb_tables()
+			     WHERE database_name = current_database() AND NOT internal
+			    UNION ALL
+			    SELECT schema_name AS table_schema, view_name AS table_name,
+			           NULL AS estimated_size, 'view' AS object_type
+			      FROM duckdb_views()
+			     WHERE database_name = current_database() AND NOT internal
 			    ORDER BY table_schema, table_name;`
 
 		var args []string
@@ -905,7 +960,9 @@ func (c *QuackClient) FetchCatalogCmd() tea.Cmd {
 		cmd := exec.CommandContext(ctx, c.cliPath, args...)
 		out, err := cmd.Output()
 		if err != nil {
-			return catalogResultMsg{err: fmt.Errorf("catalog query: %v", err)}
+			// stderr carries the Binder/Catalog error; "exit status 1" alone
+			// left the panel saying nothing useful.
+			return catalogResultMsg{err: fmt.Errorf("catalog query: %s", cliError(err))}
 		}
 		schemas, err := parseCatalogRows(out)
 		return catalogResultMsg{catalog: schemas, err: err}
@@ -927,14 +984,28 @@ func parseCatalogRows(data []byte) ([]CatalogSchema, error) {
 	for _, row := range rows {
 		sn := fmt.Sprintf("%v", row["table_schema"])
 		tn := fmt.Sprintf("%v", row["table_name"])
+
+		// Views report no size; anything else is a row-count estimate. Reading
+		// it as "0 rows" would have been a claim we can't make.
 		var n int64
-		fmt.Sscanf(fmt.Sprintf("%v", row["estimated_size"]), "%d", &n)
+		sizeKnown := false
+		if v, ok := row["estimated_size"]; ok && v != nil {
+			if _, err := fmt.Sscanf(fmt.Sprintf("%v", v), "%d", &n); err == nil {
+				sizeKnown = true
+			}
+		}
+
+		kind := "table"
+		if v, ok := row["object_type"]; ok && v != nil {
+			kind = fmt.Sprintf("%v", v)
+		}
+
 		if _, ok := schemaMap[sn]; !ok {
 			schemaMap[sn] = &CatalogSchema{Name: sn, Open: true}
 			order = append(order, sn)
 		}
 		schemaMap[sn].Tables = append(schemaMap[sn].Tables, CatalogTable{
-			Name: tn, Format: "parquet", Rows: n,
+			Name: tn, Format: kind, Rows: n, SizeKnown: sizeKnown,
 		})
 	}
 	out := make([]CatalogSchema, 0, len(order))
