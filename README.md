@@ -37,15 +37,15 @@ binary; shells out to the `duckdb` CLI for live operations.
 ```
 🦆 Pintail  ─  DuckDB Quack Protocol Manager  v0.1.0
 ─────────────────────────────────────────────────────────────────────────
- ● central-catalog [quack]   quack://catalog:9494                12ms
- ● lake-prod [ducklake]      ducklake:→central-catalog  →  s3:…  18ms
- ● local-dev [local]         file:/data/analytics.duckdb          1ms
+▸ 1:● central-catalog [quack]   quack://catalog:9494             12ms
+  2:● lake-prod [ducklake]      ducklake:→central-catalog  →  s3:…  18ms
+  3:● local-dev [local]         file:/data/analytics.duckdb          1ms
 
-╭─ ACTIVE CONNECTIONS ─────────────────────╮ ╭─ DUCKLAKE CATALOG ──────────╮
+╭─ ACTIVE CONNECTIONS · central-catalog ───╮ ╭─ CATALOG · central-catalog ─╮
 │ ID   IP Address      Identity   Status   │ │ ▼ analytics                 │
-│ c01  10.0.1.5        analyst1   ● active │ │   ├─ orders   parquet 4.8M  │
+│ 2    10.0.1.5        analyst1   ● active │ │   ├─ orders   table 4.8M    │
 ╰──────────────────────────────────────────╯ ╰─────────────────────────────╯
- q quit  tab panel  r refresh  t tokens  s sql  l lake  x tls  p auth  a conn
+ q quit  tab panel  [ ] connection  r refresh  t tokens  s sql  l lake  x tls  p auth  a conn
 ```
 
 ## What this is — and isn't
@@ -237,7 +237,7 @@ or a bare path to a `.duckdb` or `.sqlite` file (extension-based detection).
 
 | Screen                  | Key | What it does                                                                                                            |
 |-------------------------|-----|-------------------------------------------------------------------------------------------------------------------------|
-| **Dashboard**           | —   | Live ping status for every connection, sessions table, catalog tree                                                     |
+| **Dashboard**           | —   | Live ping status for every connection; sessions and catalog for the selected one (`[`/`]` or `1`–`9` to switch)          |
 | **Secrets**             | `t` | Two modes (toggle with `tab`): **Quack tokens** for server auth, **Storage secrets** for object-store credentials       |
 | **SQL scratchpad**      | `s` | Quick verification queries; **CSV / Parquet export** via `ctrl+e` (for audit trails, not analytics)                     |
 | **DuckLake snapshots**  | `l` | List `<catalog>.snapshots()`; renders time-travel and `ducklake_expire_snapshots` SQL                                   |
@@ -342,8 +342,14 @@ routing as the scratchpad — including `catalog_ref` resolution.
 Three independent timers keep subprocess spawning under control:
 
 - **Ping** (5s) — cheap reachability check (TCP dial or file stat). No subprocess.
+  A `local` connection whose path is a remote URI is not probed at all.
 - **Sessions** (15s) — refreshes sessions/snapshots for *online* connections.
 - **Catalog** — fetched once on each offline→online transition, plus on demand via `r`.
+
+Every result is stored against the connection that produced it, so polls from
+several servers don't overwrite each other, and both dashboard panels name the
+connection they're describing. A failed refresh keeps the last known-good
+listing and shows the backend's error above it rather than blanking the panel.
 
 ## Building
 
@@ -425,7 +431,7 @@ Other files written under `~/.duckdb/`:
 
 ## Keybindings
 
-**Dashboard:** `q` quit · `tab` switch panel · `↑↓` navigate · `r` refresh · `t` tokens · `s` sql · `l` lake · `x` tls · `p` auth · `a` conn
+**Dashboard:** `q` quit · `tab` switch panel · `↑↓` navigate · `[`/`]` or `1`–`9` select connection · `r` refresh · `t` tokens · `s` sql · `l` lake · `x` tls · `p` auth · `a` conn
 
 **Secrets manager (`t`):** `tab` switch mode<span></span>· in **Quack tokens** mode: `↑↓` select · `n` new · `r` rotate · `d` revoke · `v` reveal · `e` export · `esc` back<span></span>· in **Storage secrets** mode: `↑↓` select · `n` new · `d` delete · `v` reveal · `e` export · `←→` cycle secret type in form · `esc` back
 

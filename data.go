@@ -58,26 +58,12 @@ func tickCmd() tea.Cmd {
 	})
 }
 
-// ── mock / seed data ──────────────────────────────────────────────────────
-//
-// Earlier versions of Pintail shipped with fabricated "demo" connections and
-// a fake catalog tree so the dashboard would look populated even when offline.
-// That turned out to be confusing — it looks real, but none of it is. The
-// honest default is empty state until a real server is reachable. See the
-// "Getting started" section in the README for how to spin up a local
-// Quack server, a local .duckdb file, or a test DuckLake to actually drive
-// the dashboard.
-
-var mockConnections []Connection = nil
-
-var mockCatalog []CatalogSchema = nil
-
-// refreshConnections used to fake live metric changes per tick. It now just
-// returns its input unchanged — the dashboard reflects whatever the live
-// session fetch returned, and nothing else.
-func refreshConnections(conns []Connection) []Connection {
-	return conns
-}
+// Earlier versions shipped fabricated "demo" connections and a fake catalog
+// tree so the dashboard looked populated when offline. That was removed for
+// being confusing — it looked real and none of it was — leaving behind a set of
+// nil stubs and a no-op refresh function, which are now gone too. The dashboard
+// shows what a backend actually reported, per connection, and nothing else. See
+// the README "Getting started" section for how to give it something to report.
 
 // ── width-safe helpers ────────────────────────────────────────────────────
 //

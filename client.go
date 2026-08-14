@@ -760,6 +760,10 @@ func parseJSONRows(query string, data []byte) (*QueryResult, error) {
 
 // sessionResultMsg is sent when a session poll completes.
 type sessionResultMsg struct {
+	// idx identifies which connection this result describes. Without it the
+	// dashboard stored one global result set, so with several servers online
+	// the last responder won and nothing said whose data was on screen.
+	idx         int
 	connections []Connection
 	// reportedCount is the connection count the backend gave us, if any. It is
 	// carried separately from `connections` because DuckDB exposes a count but
@@ -773,33 +777,33 @@ type sessionResultMsg struct {
 //   - Quack    — queries duckdb_connections() on the remote.
 //   - Local    — reports a single "local" session (us).
 //   - DuckLake — reports the most recent snapshots as pseudo-sessions.
-func (c *QuackClient) FetchSessionsCmd() tea.Cmd {
+func (c *QuackClient) FetchSessionsCmd(idx int) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 		defer cancel()
 
 		state := c.GetState()
 		if !state.Online || !c.hasCLI {
-			return sessionResultMsg{err: fmt.Errorf("offline or no CLI")}
+			return sessionResultMsg{idx: idx, err: fmt.Errorf("offline or no CLI")}
 		}
 
 		// Real sessions only exist on backends that expose duckdb_connections()
 		// over a network. For others we synthesise something useful per type
 		// so the dashboard panel isn't empty.
 		if c.Config.Supports(CapSessions) {
-			return c.fetchQuackSessions(ctx)
+			return c.fetchQuackSessions(ctx, idx)
 		}
 
 		switch c.Config.Type {
 		case ConnDuckLake:
-			return c.fetchDuckLakeSnapshots(ctx)
+			return c.fetchDuckLakeSnapshots(ctx, idx)
 		case ConnLocal:
-			return sessionResultMsg{connections: []Connection{{
+			return sessionResultMsg{idx: idx, connections: []Connection{{
 				ID: "loc1", IP: "local", Identity: "duckdb-cli",
 				Catalog: filepath.Base(c.Config.Path), Status: "active",
 			}}}
 		}
-		return sessionResultMsg{err: fmt.Errorf("no sessions for %s", c.Config.Type)}
+		return sessionResultMsg{idx: idx, err: fmt.Errorf("no sessions for %s", c.Config.Type)}
 	}
 }
 
@@ -815,7 +819,7 @@ func (c *QuackClient) FetchSessionsCmd() tea.Cmd {
 //
 // If a Quack server grows a real session-listing function, that is the right
 // source for this panel and this query should be replaced by it.
-func (c *QuackClient) fetchQuackSessions(ctx context.Context) tea.Msg {
+func (c *QuackClient) fetchQuackSessions(ctx context.Context, idx int) tea.Msg {
 	sql := `SELECT current_connection_id() AS connection_id,
 	               session_user()          AS client_context,
 	               current_database()      AS catalog,
@@ -823,10 +827,10 @@ func (c *QuackClient) fetchQuackSessions(ctx context.Context) tea.Msg {
 	cmd := exec.CommandContext(ctx, c.cliPath, c.cliArgs(sql, "-json")...)
 	out, err := cmd.Output()
 	if err != nil {
-		return sessionResultMsg{err: fmt.Errorf("session query: %s", cliError(err))}
+		return sessionResultMsg{idx: idx, err: fmt.Errorf("session query: %s", cliError(err))}
 	}
 	conns, reported, err := parseSessionRows(out, c.Config)
-	return sessionResultMsg{connections: conns, reportedCount: reported, err: err}
+	return sessionResultMsg{idx: idx, connections: conns, reportedCount: reported, err: err}
 }
 
 // cliError prefers the subprocess's stderr over Go's bare "exit status 1",
@@ -838,7 +842,7 @@ func cliError(err error) string {
 	return err.Error()
 }
 
-func (c *QuackClient) fetchDuckLakeSnapshots(ctx context.Context) tea.Msg {
+func (c *QuackClient) fetchDuckLakeSnapshots(ctx context.Context, idx int) tea.Msg {
 	// snapshots() is a table macro DuckLake registers in the attached catalog's
 	// default schema, expanding to ducklake_snapshots('_lake'); either spelling
 	// works once ATTACH ... AS _lake has run.
@@ -849,10 +853,10 @@ func (c *QuackClient) fetchDuckLakeSnapshots(ctx context.Context) tea.Msg {
 		// Report the failure. This used to substitute a synthetic "lake" row,
 		// which made a missing ducklake extension or an unreachable catalog
 		// look like a healthy connection with one session.
-		return sessionResultMsg{err: fmt.Errorf("snapshot query: %s", cliError(err))}
+		return sessionResultMsg{idx: idx, err: fmt.Errorf("snapshot query: %s", cliError(err))}
 	}
 	conns, err := parseDuckLakeSnapshots(out, c.Config)
-	return sessionResultMsg{connections: conns, err: err}
+	return sessionResultMsg{idx: idx, connections: conns, err: err}
 }
 
 // parseDuckLakeSnapshots renders snapshots as "connections" for the dashboard.
@@ -957,20 +961,22 @@ func parseSessionRows(data []byte, cfg ServerConfig) ([]Connection, string, erro
 
 // catalogResultMsg is sent when a catalog poll completes.
 type catalogResultMsg struct {
+	idx     int // which connection this catalog belongs to
 	catalog []CatalogSchema
 	err     error
 }
 
-// FetchCatalogCmd queries information_schema.tables on whichever backend
-// this client points at — works uniformly across Quack, Local, and DuckLake.
-func (c *QuackClient) FetchCatalogCmd() tea.Cmd {
+// FetchCatalogCmd lists the relations on whichever backend this client points
+// at — works uniformly across Quack, Local, and DuckLake. idx identifies the
+// connection so the dashboard can attribute the result.
+func (c *QuackClient) FetchCatalogCmd(idx int) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
 		state := c.GetState()
 		if !state.Online || !c.hasCLI {
-			return catalogResultMsg{err: fmt.Errorf("offline or no CLI")}
+			return catalogResultMsg{idx: idx, err: fmt.Errorf("offline or no CLI")}
 		}
 
 		// information_schema.tables has no estimated_size column — selecting it
@@ -996,10 +1002,10 @@ func (c *QuackClient) FetchCatalogCmd() tea.Cmd {
 		if err != nil {
 			// stderr carries the Binder/Catalog error; "exit status 1" alone
 			// left the panel saying nothing useful.
-			return catalogResultMsg{err: fmt.Errorf("catalog query: %s", cliError(err))}
+			return catalogResultMsg{idx: idx, err: fmt.Errorf("catalog query: %s", cliError(err))}
 		}
 		schemas, err := parseCatalogRows(out)
-		return catalogResultMsg{catalog: schemas, err: err}
+		return catalogResultMsg{idx: idx, catalog: schemas, err: err}
 	}
 }
 

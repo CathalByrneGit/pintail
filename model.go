@@ -274,6 +274,85 @@ func (f *addServerForm) valid() bool {
 	}
 }
 
+// ── per-connection metadata ───────────────────────────────────────────────
+
+// connData is the last metadata fetched for one connection. Errors are kept
+// alongside the data rather than replacing it: a failed refresh should say so
+// without discarding the last known-good listing.
+type connData struct {
+	sessions      []Connection
+	catalog       []CatalogSchema
+	reportedCount string // connection count as reported by the backend
+	sessionErr    string
+	catalogErr    string
+	sessionsAt    time.Time
+	catalogAt     time.Time
+}
+
+// syncConnData resizes the per-connection metadata to match the connection
+// list and keeps the selection in range — connections can be added and deleted
+// while fetches for the old indices are still in flight.
+func (m *Model) syncConnData() {
+	if len(m.data) > len(m.configs) {
+		m.data = m.data[:len(m.configs)]
+	}
+	for len(m.data) < len(m.configs) {
+		m.data = append(m.data, connData{})
+	}
+	if m.selected >= len(m.configs) {
+		m.selected = len(m.configs) - 1
+	}
+	if m.selected < 0 {
+		m.selected = 0
+	}
+}
+
+// removeConnData drops the metadata for a deleted connection so the remaining
+// entries stay aligned with the connections they describe.
+func (m *Model) removeConnData(idx int) {
+	if idx < 0 || idx >= len(m.data) {
+		return
+	}
+	m.data = append(m.data[:idx], m.data[idx+1:]...)
+}
+
+// selectedData returns the metadata for the connection the dashboard is
+// showing. The second return is false when there is nothing to show.
+func (m Model) selectedData() (connData, bool) {
+	if m.selected < 0 || m.selected >= len(m.data) {
+		return connData{}, false
+	}
+	return m.data[m.selected], true
+}
+
+// selectedName is the display name of the selected connection, or "" if none.
+func (m Model) selectedName() string {
+	if m.selected < 0 || m.selected >= len(m.configs) {
+		return ""
+	}
+	return m.configs[m.selected].Name
+}
+
+// selectConnection moves the dashboard to a connection by index, ignoring
+// out-of-range requests (the digit keys are direct-dial, so 9 on a two-server
+// setup should do nothing rather than jump).
+func (m *Model) selectConnection(idx int) {
+	if idx >= 0 && idx < len(m.configs) {
+		m.selected = idx
+		m.connTable.SetRows(connectionRows(m.data[idx].sessions))
+		m.connTable.GotoTop()
+	}
+}
+
+// cycleConnection steps the selection by delta, wrapping.
+func (m *Model) cycleConnection(delta int) {
+	if len(m.configs) == 0 {
+		return
+	}
+	next := (m.selected + delta + len(m.configs)) % len(m.configs)
+	m.selectConnection(next)
+}
+
 // ── Model ─────────────────────────────────────────────────────────────────
 
 type Model struct {
@@ -291,18 +370,17 @@ type Model struct {
 	wasOnline []bool
 
 	// dashboard
-	focus       panel
-	connections []Connection
-	catalog     []CatalogSchema
-	connTable   table.Model
-	tick        int
+	focus     panel
+	connTable table.Model
+	tick      int
 
-	// Last error from each background fetch, shown in the panel it belongs to.
-	// Without these, a failing metadata query was indistinguishable from a
-	// backend that simply had nothing to report.
-	sessionErr    string
-	catalogErr    string
-	reportedConns string // connection count as reported by the backend
+	// Metadata per connection, index-aligned with clients/configs, and which
+	// one the dashboard panels are showing. This used to be a single global
+	// set of sessions and catalog, so with several servers online the last
+	// responder overwrote everyone else and nothing on screen said whose data
+	// you were looking at.
+	data     []connData
+	selected int
 
 	// token manager
 	tokenMgr TokenManager
@@ -338,8 +416,7 @@ func NewModel() Model {
 		configs:        configs,
 		storageSecrets: secrets,
 		wasOnline:      make([]bool, len(clients)),
-		connections:    mockConnections,
-		catalog:        mockCatalog,
+		data:           make([]connData, len(configs)),
 		focus:          panelConnections,
 		currentView:    viewDashboard,
 		tokenMgr:       NewTokenManager(),
@@ -348,7 +425,7 @@ func NewModel() Model {
 		authEditor:     NewAuthEditor(LoadTokens(), clients),
 		snapshots:      NewSnapshotsView(clients),
 	}
-	m.connTable = buildConnectionTable(mockConnections)
+	m.connTable = buildConnectionTable(nil)
 	return m
 }
 
@@ -422,7 +499,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// relatively static, so this avoids re-fetching it on every ping).
 		if justConnected && m.clients[msg.idx].HasCLI() {
 			c := m.clients[msg.idx]
-			return m, tea.Batch(c.FetchSessionsCmd(), c.FetchCatalogCmd())
+			return m, tea.Batch(c.FetchSessionsCmd(msg.idx), c.FetchCatalogCmd(msg.idx))
 		}
 		return m, nil
 
@@ -437,42 +514,54 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// ── session ticker: refresh sessions for ONLINE servers only ───────────
 	case sessionTickMsg:
 		cmds := []tea.Cmd{sessionTickCmd()}
-		for _, c := range m.clients {
+		for i, c := range m.clients {
 			if c.GetState().Online && c.HasCLI() {
-				cmds = append(cmds, c.FetchSessionsCmd())
+				cmds = append(cmds, c.FetchSessionsCmd(i))
 			}
 		}
 		return m, tea.Batch(cmds...)
 
 	// ── live session results ───────────────────────────────────────────────
 	case sessionResultMsg:
+		// A result can arrive after its connection was deleted, in which case
+		// the index no longer refers to the server that produced it.
+		if msg.idx < 0 || msg.idx >= len(m.data) {
+			return m, nil
+		}
+		d := &m.data[msg.idx]
+		d.sessionsAt = time.Now()
 		if msg.err != nil {
-			m.sessionErr = msg.err.Error()
+			d.sessionErr = msg.err.Error()
 			return m, nil
 		}
 		// The result is applied even when it is empty, so rows that no longer
 		// exist stop being shown as though they were live.
-		m.sessionErr = ""
-		m.reportedConns = msg.reportedCount
-		m.connections = msg.connections
-		m.connTable.SetRows(connectionRows(m.connections))
+		d.sessionErr = ""
+		d.reportedCount = msg.reportedCount
+		d.sessions = msg.connections
+		if msg.idx == m.selected {
+			m.connTable.SetRows(connectionRows(d.sessions))
+		}
 		return m, nil
 
 	// ── live catalog results ───────────────────────────────────────────────
 	case catalogResultMsg:
-		if msg.err != nil {
-			m.catalogErr = msg.err.Error()
+		if msg.idx < 0 || msg.idx >= len(m.data) {
 			return m, nil
 		}
-		m.catalogErr = ""
-		m.catalog = msg.catalog
+		d := &m.data[msg.idx]
+		d.catalogAt = time.Now()
+		if msg.err != nil {
+			d.catalogErr = msg.err.Error()
+			return m, nil
+		}
+		d.catalogErr = ""
+		d.catalog = msg.catalog
 		return m, nil
 
 	// ── data ticker ───────────────────────────────────────────────────────
 	case tickMsg:
 		m.tick++
-		m.connections = refreshConnections(m.connections)
-		m.connTable.SetRows(connectionRows(m.connections))
 		var tmCmd tea.Cmd
 		m.tokenMgr, tmCmd = m.tokenMgr.Update(msg)
 		var authCmd tea.Cmd
@@ -547,22 +636,27 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			case "r":
-				// Refresh: re-poll live data for online servers; fall back to
-				// nudging the mock counters when nothing is connected.
+				// Refresh every online connection. Each result is attributed to
+				// the connection that produced it, so this no longer races.
 				var cmds []tea.Cmd
-				anyOnline := false
-				for _, c := range m.clients {
+				for i, c := range m.clients {
 					if c.GetState().Online && c.HasCLI() {
-						anyOnline = true
-						cmds = append(cmds, c.FetchSessionsCmd(), c.FetchCatalogCmd())
+						cmds = append(cmds, c.FetchSessionsCmd(i), c.FetchCatalogCmd(i))
 					}
 				}
-				if !anyOnline {
-					m.connections = refreshConnections(m.connections)
-					m.connTable.SetRows(connectionRows(m.connections))
-					return m, nil
-				}
 				return m, tea.Batch(cmds...)
+
+			// Which connection the panels describe. ] / [ cycle, and the digits
+			// dial one directly.
+			case "]", "}":
+				m.cycleConnection(1)
+				return m, nil
+			case "[", "{":
+				m.cycleConnection(-1)
+				return m, nil
+			case "1", "2", "3", "4", "5", "6", "7", "8", "9":
+				m.selectConnection(int(msg.String()[0] - '1'))
+				return m, nil
 			}
 
 		case viewTokens:
@@ -676,6 +770,11 @@ func (m Model) updateAddServer(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				if f.listCursor < len(m.wasOnline) {
 					m.wasOnline = append(m.wasOnline[:f.listCursor], m.wasOnline[f.listCursor+1:]...)
 				}
+				// Drop this connection's metadata so the remaining entries stay
+				// aligned with the connections they describe.
+				m.removeConnData(f.listCursor)
+				m.syncConnData()
+				m.selectConnection(m.selected)
 				m.clients = InitClients(m.configs, m.storageSecrets)
 				servers := make([]ServerInfo, len(m.configs))
 				for i, c := range m.configs {
@@ -812,6 +911,7 @@ func (m Model) updateAddServer(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// Rebuild all clients so the shared resolver sees the latest configs.
 		// This matters for DuckLake configs that reference others by name.
 		m.clients = InitClients(m.configs, m.storageSecrets)
+		m.syncConnData()
 
 		servers := make([]ServerInfo, len(m.configs))
 		for i, c := range m.configs {
@@ -973,22 +1073,44 @@ func (m Model) viewHeader() string {
 		}
 
 		typeBadge := mutedStyle.Render(" [" + string(cfg.Type) + "]")
-		chip := dot + " " + labelStyle.Render(cfg.Name) +
+
+		// The selected connection is the one the panels below describe, so it
+		// has to be identifiable at a glance — and the digit that selects it is
+		// worth showing while we're here.
+		name := labelStyle.Render(cfg.Name)
+		marker := "  "
+		if i == m.selected {
+			marker = amberStyle.Render("▸ ")
+			name = lipgloss.NewStyle().
+				Foreground(colorDarkBg).Background(colorDuckYellow).Bold(true).
+				Render(" " + cfg.Name + " ")
+		}
+		index := ""
+		if i < 9 {
+			index = mutedStyle.Render(fmt.Sprintf("%d:", i+1))
+		}
+
+		chip := marker + index + dot + " " + name +
 			typeBadge +
 			mutedStyle.Render("  "+truncate(cfg.DisplayURI(), 40)) +
 			statusDetail
 		chips = append(chips, chip)
 	}
 
-	activeCount := 0
-	for _, c := range m.connections {
-		if c.Status == "active" {
-			activeCount++
+	// The summary describes the selected connection, since that is whose
+	// sessions the panel below is listing.
+	connSummary := ""
+	if d, ok := m.selectedData(); ok {
+		activeCount := 0
+		for _, c := range d.sessions {
+			if c.Status == "active" {
+				activeCount++
+			}
 		}
+		connSummary = mutedStyle.Render("  sessions  ") +
+			greenStyle.Render(fmt.Sprintf("%d active", activeCount)) +
+			mutedStyle.Render(fmt.Sprintf(" / %d listed", len(d.sessions)))
 	}
-	connSummary := mutedStyle.Render("  connections  ") +
-		greenStyle.Render(fmt.Sprintf("%d active", activeCount)) +
-		mutedStyle.Render(fmt.Sprintf(" / %d total", len(m.connections)))
 
 	serverRow := "  " + strings.Join(chips, mutedStyle.Render("   ·   ")) + connSummary
 	divider := mutedStyle.Render(strings.Repeat("─", m.width))
@@ -996,18 +1118,25 @@ func (m Model) viewHeader() string {
 }
 
 func (m Model) viewConnectionsPanel(width, height int) string {
+	d, have := m.selectedData()
+
+	// Name the connection in the title: with several servers configured, an
+	// unlabelled table of sessions says nothing about whose sessions they are.
 	title := labelStyle.Render("ACTIVE CONNECTIONS")
-	if m.reportedConns != "" {
+	if name := m.selectedName(); name != "" {
+		title += mutedStyle.Render("  ·  ") + brightStyle.Render(name)
+	}
+	if have && d.reportedCount != "" {
 		// DuckDB reports a count but cannot enumerate peers, so the count is
 		// labelled as the backend's rather than implied by the row count.
-		title += mutedStyle.Render("   backend reports " + m.reportedConns + " connection(s)")
+		title += mutedStyle.Render("   backend reports " + d.reportedCount + " connection(s)")
 	}
 
 	rows := []string{title, ""}
-	if m.sessionErr != "" {
+	if have && d.sessionErr != "" {
 		rows = append(rows,
 			redStyle.Render("✕ session query failed"),
-			mutedStyle.Render("  "+truncate(firstLine(m.sessionErr), width-6)),
+			mutedStyle.Render("  "+truncate(firstLine(d.sessionErr), width-6)),
 			"")
 	}
 	rows = append(rows, m.connTable.View())
@@ -1020,15 +1149,21 @@ func (m Model) viewConnectionsPanel(width, height int) string {
 }
 
 func (m Model) viewCatalogPanel(width, height int) string {
-	var lines []string
-	lines = append(lines, labelStyle.Render("DUCKLAKE CATALOG"), "")
+	d, _ := m.selectedData()
 
-	if len(m.catalog) == 0 {
-		if m.catalogErr != "" {
+	var lines []string
+	title := labelStyle.Render("CATALOG")
+	if name := m.selectedName(); name != "" {
+		title += mutedStyle.Render("  ·  ") + brightStyle.Render(name)
+	}
+	lines = append(lines, title, "")
+
+	if len(d.catalog) == 0 {
+		if d.catalogErr != "" {
 			lines = append(lines,
 				redStyle.Render("  ✕ catalog query failed"),
 				"",
-				mutedStyle.Render("  "+truncate(firstLine(m.catalogErr), width-6)),
+				mutedStyle.Render("  "+truncate(firstLine(d.catalogErr), width-6)),
 			)
 		} else {
 			lines = append(lines,
@@ -1047,7 +1182,7 @@ func (m Model) viewCatalogPanel(width, height int) string {
 		return style.Width(width - 2).Height(height - 1).Render(strings.Join(lines, "\n"))
 	}
 
-	for _, schema := range m.catalog {
+	for _, schema := range d.catalog {
 		arrow := "▶"
 		if schema.Open {
 			arrow = "▼"
@@ -1083,6 +1218,7 @@ func (m Model) viewDashboardFooter() string {
 	keys := strings.Join([]string{
 		keyBadge("q") + " quit",
 		keyBadge("tab") + " panel",
+		keyBadge("[ ]") + " connection",
 		keyBadge("r") + " refresh",
 		keyBadge("t") + " tokens",
 		keyBadge("s") + " sql",

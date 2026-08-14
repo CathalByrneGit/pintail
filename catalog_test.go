@@ -83,7 +83,7 @@ func TestMetadataQueriesAgainstRealDuckDB(t *testing.T) {
 	}
 
 	t.Run("catalog", func(t *testing.T) {
-		msg, ok := c.FetchCatalogCmd()().(catalogResultMsg)
+		msg, ok := c.FetchCatalogCmd(0)().(catalogResultMsg)
 		if !ok {
 			t.Fatal("FetchCatalogCmd returned the wrong message type")
 		}
