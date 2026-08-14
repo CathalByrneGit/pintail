@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -31,10 +33,19 @@ type AuthEditor struct {
 	permCursor int // selected permission row (right panel)
 	focus      int // 0 = policy list, 1 = perm list
 
-	applyMsg string
-	applyTTL int
+	applyMsg   string
+	applyIsErr bool
+	applyTTL   int
+
+	// dirty records whether any permission has been toggled since the editor
+	// was opened, so the screen can say that edits are pending and the root
+	// model knows to write them back to the tokens.
+	dirty bool
 
 	clients []*QuackClient
+	// targetIdx selects which connection an applied policy is sent to. Apply
+	// used to always use clients[0] regardless of the selected token.
+	targetIdx int
 }
 
 // ── constructor ───────────────────────────────────────────────────────────
@@ -50,7 +61,45 @@ func NewAuthEditor(tokens []Token, clients []*QuackClient) AuthEditor {
 			Active:    t.Active,
 		}
 	}
-	return AuthEditor{policies: policies, clients: clients}
+
+	// Default the apply target to the first connection that can actually accept
+	// a token policy — a Quack server. Anything else has no notion of one.
+	target := -1
+	for i, c := range clients {
+		if c.Config.Supports(CapTokenAuth) {
+			target = i
+			break
+		}
+	}
+	return AuthEditor{policies: policies, clients: clients, targetIdx: target}
+}
+
+// Permissions returns the granted operation list for each policy, keyed by
+// token name, so the caller can write toggles back to the tokens they came
+// from. Edits used to live only in this screen and were discarded on esc.
+func (a AuthEditor) Permissions() map[string][]string {
+	out := make(map[string][]string, len(a.policies))
+	for _, p := range a.policies {
+		var ops []string
+		for _, perm := range p.Perms {
+			if perm.Allowed && perm.Op != "ALL" {
+				ops = append(ops, perm.Op)
+			}
+		}
+		out[p.TokenName] = ops
+	}
+	return out
+}
+
+// Dirty reports whether any permission was toggled.
+func (a AuthEditor) Dirty() bool { return a.dirty }
+
+// targetClient returns the connection an apply would be sent to, or nil.
+func (a AuthEditor) targetClient() *QuackClient {
+	if a.targetIdx < 0 || a.targetIdx >= len(a.clients) {
+		return nil
+	}
+	return a.clients[a.targetIdx]
 }
 
 func buildPerms(granted []string) []Permission {
@@ -120,6 +169,7 @@ func (a AuthEditor) Update(msg tea.Msg) (AuthEditor, tea.Cmd) {
 				p := &a.policies[a.cursor]
 				if a.permCursor < len(p.Perms) {
 					p.Perms[a.permCursor].Allowed = !p.Perms[a.permCursor].Allowed
+					a.dirty = true
 					// "ALL" toggle: flip all others
 					if p.Perms[a.permCursor].Op == "ALL" {
 						v := p.Perms[a.permCursor].Allowed
@@ -130,23 +180,83 @@ func (a AuthEditor) Update(msg tea.Msg) (AuthEditor, tea.Cmd) {
 				}
 			}
 
+		// Cycle which connection an apply would target. Silently applying to
+		// clients[0] meant a policy could land on a server that had nothing to
+		// do with the selected token.
+		case "T":
+			a.cycleTarget()
+
 		case "a":
-			// Apply — generate SQL and send via CLI if available
-			if a.cursor < len(a.policies) {
-				sql := a.applySQL(a.policies[a.cursor])
-				a.applyMsg = "Generated: " + truncate(sql, 60)
-				a.applyTTL = 6
-				// If we have an online client, ship it
-				if len(a.clients) > 0 {
-					c := a.clients[0]
-					if c.GetState().Online && c.HasCLI() {
-						return a, c.QueryAsync(sql, c.Config.ToServerInfo())
-					}
-				}
+			// Apply — generate the SQL and send it to the chosen target.
+			if a.cursor >= len(a.policies) {
+				return a, nil
 			}
+			sql := a.applySQL(a.policies[a.cursor])
+			c := a.targetClient()
+			switch {
+			case c == nil:
+				a.setApplyMsg("no Quack connection to apply to — SQL shown below to copy", true)
+			case !c.HasCLI():
+				a.setApplyMsg("duckdb CLI not found in PATH — SQL shown below to copy", true)
+			case !c.GetState().Online:
+				a.setApplyMsg(c.Config.Name+" is offline — SQL shown below to copy", true)
+			default:
+				a.setApplyMsg("applying to "+c.Config.Name+"…", false)
+				return a, applyPolicyCmd(c, sql)
+			}
+		}
+
+	// Result of an apply. This is a distinct message from the scratchpad's
+	// queryResultMsg: routing it through that type sent the outcome to the
+	// scratchpad, so this screen never reported success or failure and the
+	// scratchpad's own result was overwritten.
+	case authApplyResultMsg:
+		if msg.err != "" {
+			a.setApplyMsg("apply failed: "+firstLine(msg.err), true)
+		} else {
+			a.setApplyMsg("applied to "+msg.target, false)
 		}
 	}
 	return a, nil
+}
+
+// authApplyResultMsg carries the outcome of an ALTER SECRET apply back to this
+// screen rather than to the scratchpad.
+type authApplyResultMsg struct {
+	target string
+	err    string
+}
+
+// applyPolicyCmd runs the generated policy SQL against one connection.
+func applyPolicyCmd(c *QuackClient, sql string) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if _, err := c.queryCLI(ctx, sql); err != nil {
+			return authApplyResultMsg{target: c.Config.Name, err: err.Error()}
+		}
+		return authApplyResultMsg{target: c.Config.Name}
+	}
+}
+
+func (a *AuthEditor) setApplyMsg(msg string, isErr bool) {
+	a.applyMsg = msg
+	a.applyIsErr = isErr
+	a.applyTTL = 8
+}
+
+// cycleTarget moves to the next connection that supports token auth.
+func (a *AuthEditor) cycleTarget() {
+	if len(a.clients) == 0 {
+		return
+	}
+	for i := 1; i <= len(a.clients); i++ {
+		next := (a.targetIdx + i) % len(a.clients)
+		if a.clients[next].Config.Supports(CapTokenAuth) {
+			a.targetIdx = next
+			return
+		}
+	}
 }
 
 // ── View helpers ──────────────────────────────────────────────────────────
@@ -235,8 +345,37 @@ func (a AuthEditor) ViewPermGrid(width int) string {
 	sql := a.applySQL(p)
 	lines = append(lines, renderCodeBlock(sql, width-4))
 
+	// ALTER SECRET is not a statement stock DuckDB accepts (it is a parser
+	// error as of 1.5.5) — whether it works depends entirely on what the Quack
+	// server adds. Saying so beats letting an apply fail mysteriously.
+	lines = append(lines,
+		mutedStyle.Render("  ALTER SECRET is not stock DuckDB syntax — applying it"),
+		mutedStyle.Render("  requires a Quack server that implements it."))
+
+	// Where an apply would go, so [a] is never a surprise.
+	target := mutedStyle.Render("  apply target  ") + redStyle.Render("none configured")
+	if c := a.targetClient(); c != nil {
+		state := "offline"
+		style := redStyle
+		if c.GetState().Online {
+			state, style = "online", greenStyle
+		}
+		target = mutedStyle.Render("  apply target  ") +
+			brightStyle.Render(c.Config.Name) + "  " + style.Render(state)
+	}
+	lines = append(lines, "", target)
+
+	if a.dirty {
+		lines = append(lines, "  "+amberStyle.Render("● unsaved permission edits")+
+			mutedStyle.Render("  saved to the token list on [esc]"))
+	}
+
 	if a.applyMsg != "" {
-		lines = append(lines, "", "  "+greenStyle.Render("✓ "+a.applyMsg))
+		if a.applyIsErr {
+			lines = append(lines, "", "  "+redStyle.Render("✕ "+a.applyMsg))
+		} else {
+			lines = append(lines, "", "  "+greenStyle.Render("✓ "+a.applyMsg))
+		}
 	}
 
 	return strings.Join(lines, "\n")
@@ -255,8 +394,9 @@ func (a AuthEditor) ViewFooter() string {
 			keyBadge("↑↓") + " select perm",
 			keyBadge("space") + " toggle",
 			keyBadge("a") + " apply",
+			keyBadge("T") + " target",
 			keyBadge("tab") + " token list",
-			keyBadge("esc") + " back",
+			keyBadge("esc") + " save & back",
 		}
 	}
 	return footerStyle.Render(strings.Join(keys, "   "))

@@ -491,6 +491,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.snapshots, snapCmd = m.snapshots.Update(msg)
 		return m, snapCmd
 
+	// ── auth policy apply result ──────────────────────────────────────────
+	case authApplyResultMsg:
+		var authCmd tea.Cmd
+		m.authEditor, authCmd = m.authEditor.Update(msg)
+		return m, authCmd
+
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c":
@@ -596,6 +602,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case viewAuth:
 			if msg.String() == "esc" {
+				// Write permission toggles back to the tokens they came from,
+				// and persist. Leaving this screen used to discard every edit.
+				if m.authEditor.Dirty() {
+					m.applyAuthEdits()
+				}
 				m.currentView = viewDashboard
 				return m, nil
 			}
@@ -833,6 +844,43 @@ func (m Model) updateAddServer(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+// applyAuthEdits copies permission toggles from the auth editor onto the
+// matching tokens and persists them. The editor is rebuilt from the token list
+// each time the screen opens, so without this step the toggles were lost the
+// moment the user pressed esc.
+func (m *Model) applyAuthEdits() {
+	perms := m.authEditor.Permissions()
+	changed := false
+	for i := range m.tokenMgr.tokens {
+		ops, ok := perms[m.tokenMgr.tokens[i].Name]
+		if !ok {
+			continue
+		}
+		if len(ops) == 0 {
+			ops = []string{}
+		}
+		if !sameStrings(m.tokenMgr.tokens[i].Permissions, ops) {
+			m.tokenMgr.tokens[i].Permissions = ops
+			changed = true
+		}
+	}
+	if changed {
+		m.tokenMgr.persist("permissions updated")
+	}
+}
+
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // ── View dispatch ─────────────────────────────────────────────────────────

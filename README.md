@@ -171,7 +171,10 @@ CALL quack_serve('quack:0.0.0.0:9494', allow_other_hostname => true);
 
 Pintail's **TLS config** screen (`x`) generates ready-to-deploy Caddy /
 Nginx / Envoy configs with the `h2c` upgrade Quack needs. The **Auth
-policy** screen (`p`) manages per-token grants via `ALTER SECRET`. For
+policy** screen (`p`) manages per-token grants via `ALTER SECRET` — which
+is not a statement stock DuckDB accepts (it is a parser error as of 1.5.5),
+so applying it needs a Quack server that implements it. The screen says so,
+and permission toggles are saved back to the token list either way. For
 the full security model see the
 [Quack security docs](https://duckdb.org/docs/current/quack/security).
 
@@ -239,7 +242,7 @@ or a bare path to a `.duckdb` or `.sqlite` file (extension-based detection).
 | **SQL scratchpad**      | `s` | Quick verification queries; **CSV / Parquet export** via `ctrl+e` (for audit trails, not analytics)                     |
 | **DuckLake snapshots**  | `l` | List `<catalog>.snapshots()`; renders time-travel and `ducklake_expire_snapshots` SQL                                   |
 | **TLS config**          | `x` | Generate Caddy / Nginx / Envoy reverse-proxy configs for HTTPS termination                                              |
-| **Auth policy**         | `p` | Toggle per-token SQL permissions; emit `ALTER SECRET` statements                                                        |
+| **Auth policy**         | `p` | Toggle per-token SQL permissions (saved back to the token list); emit `ALTER SECRET` statements                         |
 | **Connections**         | `a` | Add, edit, delete connections; persisted to `~/.duckdb/pintail.json`                                                   |
 
 ### Storage secrets
@@ -404,7 +407,7 @@ Other files written under `~/.duckdb/`:
 
 **TLS config:** `↑↓` field · `tab` proxy type · `pgup`/`pgdn` scroll · `ctrl+s` save · `esc` back
 
-**Auth policy:** `↑↓` select · `tab` switch panel · `space` toggle · `a` apply · `esc` back
+**Auth policy:** `↑↓` select · `tab` switch panel · `space` toggle · `a` apply · `T` cycle apply target · `esc` save & back
 
 **Connections (`a`):** `↑↓`/`tab` field · `←→`/`space` cycle type · `enter` advance/save · `esc` cancel; on the list panel: `e` edit · `d` delete · `→` back to form
 
