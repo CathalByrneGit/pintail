@@ -209,7 +209,7 @@ func (v SnapshotsView) ViewDetail(width int) string {
 	if c != nil {
 		lines = append(lines,
 			"",
-			mutedStyle.Render(strings.Repeat("─", width-4)),
+			mutedStyle.Render(hrule(width-4)),
 			"",
 			labelStyle.Render("TIME-TRAVEL READ"),
 			"",
@@ -300,13 +300,11 @@ func fetchSnapshots(ctx context.Context, c *QuackClient) ([]Snapshot, error) {
 		return nil, fmt.Errorf("connection offline (%s)", state.ErrMsg)
 	}
 
-	// Since attachPrefix() already does `USE _lake`, the snapshots() function
-	// is resolved against the attached catalog (it's a method on _lake, not a
-	// standalone function — `ducklake_snapshots()` does not exist).
+	// snapshots() is a table macro DuckLake registers in the attached catalog's
+	// default schema; it expands to ducklake_snapshots('_lake'), so both
+	// spellings are valid once attachPrefix() has run ATTACH ... AS _lake.
 	sql := "SELECT * FROM _lake.snapshots() ORDER BY snapshot_id DESC LIMIT 50;"
-	script := c.attachPrefix() + sql
-
-	cmd := exec.CommandContext(ctx, c.cliPath, "-json", "-c", script)
+	cmd := exec.CommandContext(ctx, c.cliPath, c.cliArgs(sql, "-json")...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("snapshot query failed: %s", strings.TrimSpace(string(out)))
@@ -315,7 +313,7 @@ func fetchSnapshots(ctx context.Context, c *QuackClient) ([]Snapshot, error) {
 }
 
 func parseSnapshotRows(data []byte) ([]Snapshot, error) {
-	data = bytes.TrimSpace(data)
+	data = lastJSONArray(bytes.TrimSpace(data))
 	if len(data) == 0 || string(data) == "[]" {
 		return nil, nil
 	}

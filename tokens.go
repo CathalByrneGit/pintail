@@ -16,17 +16,19 @@ import (
 
 // ── types ─────────────────────────────────────────────────────────────────
 
-// Token represents a scoped Quack authentication credential.
+// Token represents a scoped Quack authentication credential. Persisted under
+// "tokens" in ~/.duckdb/pintail.json, alongside the storage secrets and with
+// the same plaintext caveat.
 type Token struct {
-	ID          string
-	Name        string
-	Value       string   // full token value; never logged
-	Scope       []string // catalogs this token can access ("*" = global)
-	Permissions []string // SQL operations allowed
-	CreatedAt   time.Time
-	ExpiresAt   *time.Time // nil = never
-	LastUsed    time.Time
-	Active      bool
+	ID          string     `json:"id"`
+	Name        string     `json:"name"`
+	Value       string     `json:"value"`       // full token value; never logged
+	Scope       []string   `json:"scope"`       // catalogs this token can access ("*" = global)
+	Permissions []string   `json:"permissions"` // SQL operations allowed
+	CreatedAt   time.Time  `json:"created_at"`
+	ExpiresAt   *time.Time `json:"expires_at,omitempty"` // nil = never
+	LastUsed    time.Time  `json:"last_used,omitempty"`
+	Active      bool       `json:"active"`
 }
 
 // TokenManager holds all state for the token management view.
@@ -74,7 +76,7 @@ type tokenForm struct {
 
 func NewTokenManager() TokenManager {
 	return TokenManager{
-		tokens:  mockTokens(),
+		tokens:  LoadTokens(),
 		secrets: LoadStorageSecrets(),
 	}
 }
@@ -227,8 +229,7 @@ func (tm TokenManager) updateForm(msg tea.KeyMsg) (TokenManager, tea.Cmd) {
 		))
 		tm.cursor = len(tm.tokens) - 1
 		tm.form = nil
-		tm.successMsg = "Token created"
-		tm.successTTL = 4
+		tm.persist("Token created")
 		return tm, nil
 	}
 
@@ -250,8 +251,7 @@ func (tm TokenManager) updateRotateConfirm(msg tea.KeyMsg) (TokenManager, tea.Cm
 			}
 		}
 		tm.rotateConfirm = false
-		tm.successMsg = "Token rotated — new value shown below"
-		tm.successTTL = 5
+		tm.persist("Token rotated — new value shown below")
 	case "n", "N", "esc":
 		tm.rotateConfirm = false
 	}
@@ -267,8 +267,7 @@ func (tm TokenManager) updateRevokeConfirm(msg tea.KeyMsg) (TokenManager, tea.Cm
 			}
 		}
 		tm.revokeConfirm = false
-		tm.successMsg = "Token revoked"
-		tm.successTTL = 4
+		tm.persist("Token revoked")
 	case "n", "N", "esc":
 		tm.revokeConfirm = false
 	}
@@ -326,10 +325,10 @@ func (tm TokenManager) ViewTokenList(width, height int) string {
 			}
 		}
 
-		scopeStr := strings.Join(t.Scope, ", ")
-		if len(scopeStr) > width-18 {
-			scopeStr = scopeStr[:width-21] + "…"
-		}
+		// Room left for the scope line after the cursor, dot and padding.
+		// On a narrow terminal this goes negative — truncate handles that by
+		// dropping the scope rather than slicing past the start of the string.
+		scopeStr := truncate(strings.Join(t.Scope, ", "), width-18)
 
 		line := cursor + dot + " " + style.Render(t.Name) +
 			"\n    " + mutedStyle.Render(scopeStr)
@@ -344,7 +343,7 @@ func (tm TokenManager) ViewTokenList(width, height int) string {
 		}
 	}
 	lines = append(lines, "")
-	lines = append(lines, mutedStyle.Render(strings.Repeat("─", width-6)))
+	lines = append(lines, mutedStyle.Render(hrule(width-6)))
 	lines = append(lines,
 		mutedStyle.Render("active   ")+greenStyle.Render(fmt.Sprintf("%d", active)),
 		mutedStyle.Render("revoked  ")+redStyle.Render(fmt.Sprintf("%d", len(tm.tokens)-active)),
@@ -390,8 +389,9 @@ func (tm TokenManager) ViewTokenDetail(width int) string {
 		"",
 	)
 
-	// Generated SQL block
-	sql := tokenSQL(*t)
+	// Generated SQL block — the value is elided here unless [v] is toggled,
+	// matching the masking of the Token row above.
+	sql := tokenSQL(*t, tm.showValue)
 	lines = append(lines,
 		labelStyle.Render("SQL to apply"),
 		renderCodeBlock(sql, width-4),
@@ -556,11 +556,18 @@ func generateID() string {
 	return hex.EncodeToString(b)
 }
 
-func tokenSQL(t Token) string {
+// tokenSQL renders the CREATE SECRET statement for a token.
+//
+// `full` decides whether the token value is written verbatim. Exports must be
+// runnable, so they pass true; the on-screen block passes the reveal state, so
+// the value stays elided until the operator asks for it with [v]. Rendering
+// the elided form into the export file made every exported credential
+// unusable — the reason this parameter exists rather than being a constant.
+func tokenSQL(t Token, full bool) string {
 	scope := strings.Join(t.Scope, ", ")
 	val := t.Value
-	if len(val) > 16 {
-		val = val[:16] + "…"
+	if !full {
+		val = truncate(val, 16)
 	}
 	perms := strings.Join(t.Permissions, " | ")
 	var sb strings.Builder
@@ -589,7 +596,7 @@ func exportTokenSQL(t Token) (string, error) {
 	defer f.Close()
 
 	fmt.Fprintf(f, "-- Token: %s  exported: %s\n", t.Name, time.Now().Format(time.RFC3339))
-	fmt.Fprintln(f, tokenSQL(t))
+	fmt.Fprintln(f, tokenSQL(t, true))
 	fmt.Fprintln(f)
 	return path, nil
 }
@@ -655,11 +662,16 @@ func splitTrim(s string) []string {
 	return out
 }
 
-// ── mock data ─────────────────────────────────────────────────────────────
-
-func mockTokens() []Token {
-	// Returns nothing by default — users create real tokens via the
-	// token manager (press [n] in the tokens screen). See the README
-	// "Getting started" section for how to bootstrap a working setup.
-	return nil
+// persist writes the token list to the config file and turns any failure into
+// the status message, so a save that did not happen is visible rather than
+// assumed. Tokens are credentials: losing one silently is the worst outcome
+// here, which is why every mutating action calls this.
+func (tm *TokenManager) persist(okMsg string) {
+	if err := SaveTokens(tm.tokens); err != nil {
+		tm.successMsg = "save failed: " + err.Error()
+		tm.successTTL = 8
+		return
+	}
+	tm.successMsg = okMsg
+	tm.successTTL = 4
 }

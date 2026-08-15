@@ -19,6 +19,7 @@ import (
 //   pintail ping <name>            Ping one connection by name.
 //   pintail query <name> "<sql>"   Execute SQL against one connection.
 //                                   Append --json for machine-readable output.
+//   pintail version                Print the version.
 //   pintail help                   Show this help.
 
 func main() {
@@ -52,6 +53,9 @@ func runSubcommand(args []string) error {
 			return fmt.Errorf("usage: pintail query <name> \"<sql>\" [--json]")
 		}
 		return cmdQuery(args[1], args[2], hasFlag(args, "--json"))
+	case "version", "-v", "--version":
+		fmt.Println("pintail " + versionLabel())
+		return nil
 	case "help", "-h", "--help":
 		printHelp()
 		return nil
@@ -164,11 +168,8 @@ func cmdQuery(name, sql string, asJSON bool) error {
 		return fmt.Errorf("no connection named %q", name)
 	}
 	c := NewQuackClient(cfg, makeResolver(), makeSecretResolver())
-	if !c.HasCLI() {
-		return fmt.Errorf("duckdb CLI not found in PATH (required for query subcommand)")
-	}
 
-	// Best-effort ping so we know which method to use
+	// Best-effort ping so the client knows whether it is online
 	pingCtx, pingCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	c.Ping(pingCtx)
 	pingCancel()
@@ -177,12 +178,15 @@ func cmdQuery(name, sql string, asJSON bool) error {
 		return fmt.Errorf("connection %q is offline (%s)", name, c.GetState().ErrMsg)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), QueryTimeout())
 	defer cancel()
 
-	result, err := c.queryCLI(ctx, sql)
-	if err != nil {
-		return err
+	// Same routing as the TUI, which is the point: a Quack server reachable
+	// over HTTP is queryable here without a duckdb binary. This used to reject
+	// the query outright unless the CLI was installed.
+	result := c.Query(ctx, sql)
+	if result.Err != "" {
+		return fmt.Errorf("%s", result.Err)
 	}
 
 	if asJSON {
@@ -227,6 +231,7 @@ Usage:
   pintail ping <name> [--json]     Ping one connection.
   pintail query <name> "<sql>" [--json]
                                     Execute SQL against one connection.
+  pintail version                  Print the version.
   pintail help                     Show this help.
 
 Connection types (set in the TUI's "Add Connection" screen):

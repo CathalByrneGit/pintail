@@ -46,6 +46,7 @@ type TLSGenerator struct {
 
 	savedPath string
 	savedAt   time.Time
+	saveErr   string
 }
 
 // ── constructor ───────────────────────────────────────────────────────────
@@ -127,11 +128,22 @@ func (g TLSGenerator) Update(msg tea.Msg) (TLSGenerator, tea.Cmd) {
 		case "pgdown", "ctrl+f":
 			g.configVP, _ = g.configVP.Update(msg)
 
-		case "e":
-			if path, err := g.saveToFile(); err == nil {
-				g.savedPath = path
+		// Save is ctrl+s, not "e": every field on this screen is free text, and
+		// binding a bare letter made it impossible to type — "quack.example.com"
+		// could not be entered into the Domain field at all.
+		case "ctrl+s":
+			path, err := g.saveToFile()
+			if err != nil {
+				// Silently ignoring this made a failed write look identical to
+				// a successful one.
+				g.saveErr = err.Error()
+				g.savedPath = ""
 				g.savedAt = time.Now()
+				break
 			}
+			g.saveErr = ""
+			g.savedPath = path
+			g.savedAt = time.Now()
 
 		default:
 			if len(msg.String()) == 1 {
@@ -199,7 +211,7 @@ func (g TLSGenerator) ViewForm(width int) string {
 	}
 
 	// Proxy selector
-	lines = append(lines, mutedStyle.Render(strings.Repeat("─", width-6)), "")
+	lines = append(lines, mutedStyle.Render(hrule(width-6)), "")
 	lines = append(lines, labelStyle.Render("PROXY TYPE")+"  "+mutedStyle.Render("[tab] to cycle"))
 	lines = append(lines, "")
 
@@ -221,6 +233,9 @@ func (g TLSGenerator) ViewConfig() string {
 }
 
 func (g TLSGenerator) ViewStatusBar() string {
+	if g.saveErr != "" && time.Since(g.savedAt) < 8*time.Second {
+		return "  " + redStyle.Render("✕ save failed: ") + brightStyle.Render(g.saveErr)
+	}
 	if g.savedPath != "" && time.Since(g.savedAt) < 5*time.Second {
 		return "  " + greenStyle.Render("✓ saved → "+g.savedPath)
 	}
@@ -233,7 +248,7 @@ func (g TLSGenerator) ViewFooter() string {
 		keyBadge("↑↓") + " field",
 		keyBadge("tab") + " proxy",
 		keyBadge("pgup/dn") + " scroll",
-		keyBadge("e") + " save file",
+		keyBadge("ctrl+s") + " save file",
 		keyBadge("esc") + " back",
 	}, "   ")
 	return footerStyle.Render(keys)
@@ -268,26 +283,36 @@ func (g TLSGenerator) generateConfig() string {
 func generateCaddy(domain, upstream string) string {
 	return fmt.Sprintf(`# Pintail — Caddyfile
 # Caddy handles TLS automatically (Let's Encrypt or ZeroSSL).
-# Quack uses HTTP/2; h2c forwards cleartext HTTP/2 upstream.
+#
+# The Quack server speaks plain HTTP only — HTTP/1.1 with keep-alive, no HTTP/2 —
+# so the upstream is pinned to 1.1. Forcing cleartext HTTP/2 upstream here would
+# break every request through the proxy.
 
 %s {
     reverse_proxy %s {
+        # Quack streams results back as repeated FETCH responses. Buffering
+        # them in Caddy defeats the streaming and inflates memory; -1 flushes
+        # immediately (the equivalent of nginx proxy_buffering off).
+        flush_interval -1
+
+        # Quack keeps server-side connection state alive on the persistent
+        # HTTP connection, so keep-alive upstream is correctness, not just speed.
         transport http {
-            # h2c: forward HTTP/2 cleartext to the Quack process
-            versions h2c
+            versions 1.1
+            keepalive 30s
         }
+    }
+
+    # PREPARE carries SQL and APPEND carries inserted DataChunks, so request
+    # bodies are far larger than the default cap allows.
+    request_body {
+        max_size 256MB
     }
 
     # Optional: tighten TLS
     tls {
         protocols tls1.2 tls1.3
     }
-
-    # Rate-limit unauthenticated probes
-    @no_auth {
-        not header Authorization *
-    }
-    respond @no_auth 401
 }
 
 # Redirect plain HTTP → HTTPS (Caddy does this automatically,
@@ -300,8 +325,9 @@ http://%s {
 
 func generateNginx(domain, upstream, certFile, keyFile string) string {
 	return fmt.Sprintf(`# Pintail — Nginx config
-# Requires nginx >= 1.25.1 for HTTP/2 upstream support (ngx_http_v2_module).
-# For older nginx, use the grpc_pass directive instead.
+# The Quack server speaks HTTP/1.1 with keep-alive, so proxy_pass with
+# proxy_http_version 1.1 is all that is needed upstream. "http2 on" below is
+# client-facing only and unrelated to the upstream protocol.
 
 upstream quack_backend {
     server %s;
@@ -321,6 +347,10 @@ server {
     ssl_session_cache   shared:SSL:10m;
     ssl_session_timeout 1d;
 
+    # PREPARE carries SQL and APPEND carries inserted DataChunks; the 1 MiB
+    # nginx default fails mid-INSERT.
+    client_max_body_size 256M;
+
     # HSTS (optional — enable after verifying TLS works)
     # add_header Strict-Transport-Security "max-age=63072000" always;
 
@@ -328,18 +358,24 @@ server {
         proxy_pass         http://quack_backend;
         proxy_http_version 1.1;
 
-        # WebSocket / HTTP/2 upgrade headers
-        proxy_set_header   Upgrade    $http_upgrade;
-        proxy_set_header   Connection "upgrade";
+        # Keep-alive to the upstream: an empty Connection header stops nginx
+        # sending "close" on every request. Quack has no websocket upgrade, so
+        # no Upgrade header is forwarded.
+        proxy_set_header   Connection "";
         proxy_set_header   Host       $host;
         proxy_set_header   X-Real-IP  $remote_addr;
 
         # Forward the Quack auth token as-is
         proxy_pass_header  Authorization;
 
-        # Generous timeouts for long-running analytical queries
-        proxy_read_timeout  300s;
-        proxy_send_timeout  300s;
+        # Quack streams results via repeated FETCH responses; buffering through
+        # nginx defeats the streaming and inflates memory.
+        proxy_buffering off;
+
+        # A long-running query can sit on the wire between FETCHes for minutes,
+        # well past nginx's 60s default.
+        proxy_read_timeout  600s;
+        proxy_send_timeout  600s;
         proxy_connect_timeout 5s;
     }
 }
@@ -364,6 +400,7 @@ static_resources:
     - name: quack_tls_listener
       address:
         socket_address: { address: 0.0.0.0, port_value: 443 }
+      per_connection_buffer_limit_bytes: 268435456
       filter_chains:
         - transport_socket:
             name: envoy.transport_sockets.tls
@@ -387,8 +424,12 @@ static_resources:
                     - name: quack_service
                       domains: ["%s"]
                       routes:
-                        - match:  { prefix: "/" }
-                          route:  { cluster: quack_cluster }
+                        - match: { prefix: "/" }
+                          route:
+                            cluster: quack_cluster
+                            # Envoy's default route timeout is 15s, which cuts
+                            # off a query still streaming FETCH responses.
+                            timeout: 600s
                 http_filters:
                   - name: envoy.filters.http.router
                     typed_config:
@@ -399,12 +440,16 @@ static_resources:
       type: LOGICAL_DNS
       dns_lookup_family: V4_ONLY
       lb_policy: ROUND_ROBIN
-      # h2c upstream: Quack speaks HTTP/2 cleartext
+      # PREPARE / APPEND bodies are much larger than the 1 MiB default buffer.
+      per_connection_buffer_limit_bytes: 268435456
+      # HTTP/1.1 upstream: the Quack server is cpp-httplib and does not speak
+      # HTTP/2, so the explicit config selects the HTTP/1.1 protocol options.
+      # Selecting the HTTP/2 ones here would break every request.
       typed_extension_protocol_options:
         envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
           "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
           explicit_http_config:
-            http2_protocol_options: {}
+            http_protocol_options: {}
       load_assignment:
         cluster_name: quack_cluster
         endpoints:
@@ -424,9 +469,14 @@ admin:
 // ── file export ───────────────────────────────────────────────────────────
 
 func (g TLSGenerator) saveToFile() (string, error) {
-	home, _ := os.UserHomeDir()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("cannot locate home directory: %w", err)
+	}
 	dir := filepath.Join(home, ".duckdb", "tls")
-	os.MkdirAll(dir, 0750)
+	if err := os.MkdirAll(dir, 0750); err != nil {
+		return "", err
+	}
 
 	name := fmt.Sprintf("pintail-%s", g.proxy.FileExt())
 	path := filepath.Join(dir, name)

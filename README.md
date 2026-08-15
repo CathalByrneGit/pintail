@@ -25,9 +25,17 @@
 
 Pintail is for the operational side of running DuckDB-as-a-server:
 connection topology, token administration, TLS reverse-proxy generation,
-DuckLake snapshot inspection, per-token auth policy editing, and a small
-SQL scratchpad for quick admin checks. It targets teams running Quack
-in production with multi-writer DuckLake setups — not data analysts.
+DuckLake snapshot inspection, auth policy editing, request-log inspection, and
+a small SQL scratchpad for quick admin checks. It is aimed at people operating
+Quack and multi-writer DuckLake setups — not at data analysts.
+
+> **Quack itself is beta.** Upstream describes it as a pre-release extension
+> that is *"not ready for production and subject to breaking changes until the
+> release of DuckDB v2.0"*, with function names, settings and defaults still
+> liable to change. Pintail is built against the versions listed under
+> [Verified against](#verified-against); a rename upstream will break the
+> queries it generates. `FORCE INSTALL quack;` is upstream's advice when
+> clients disagree.
 
 Built with [Bubble Tea](https://github.com/charmbracelet/bubbletea),
 [Bubbles](https://github.com/charmbracelet/bubbles), and
@@ -37,15 +45,15 @@ binary; shells out to the `duckdb` CLI for live operations.
 ```
 🦆 Pintail  ─  DuckDB Quack Protocol Manager  v0.1.0
 ─────────────────────────────────────────────────────────────────────────
- ● central-catalog [quack]   quack://catalog:9494                12ms
- ● lake-prod [ducklake]      ducklake:→central-catalog  →  s3:…  18ms
- ● local-dev [local]         file:/data/analytics.duckdb          1ms
+▸ 1:● central-catalog [quack]   quack://catalog:9494             12ms
+  2:● lake-prod [ducklake]      ducklake:→central-catalog  →  s3:…  18ms
+  3:● local-dev [local]         file:/data/analytics.duckdb          1ms
 
-╭─ ACTIVE CONNECTIONS ─────────────────────╮ ╭─ DUCKLAKE CATALOG ──────────╮
+╭─ ACTIVE CONNECTIONS · central-catalog ───╮ ╭─ CATALOG · central-catalog ─╮
 │ ID   IP Address      Identity   Status   │ │ ▼ analytics                 │
-│ c01  10.0.1.5        analyst1   ● active │ │   ├─ orders   parquet 4.8M  │
+│ 2    10.0.1.5        analyst1   ● active │ │   ├─ orders   table 4.8M    │
 ╰──────────────────────────────────────────╯ ╰─────────────────────────────╯
- q quit  tab panel  r refresh  t tokens  s sql  l lake  x tls  p auth  a conn
+ q quit  tab panel  [ ] connection  r refresh  t tokens  s sql  l lake  L logs  x tls  p auth  a conn
 ```
 
 ## What this is — and isn't
@@ -122,7 +130,8 @@ Then add a DuckLake connection in Pintail:
 - Storage: `/tmp/lake/data`
 
 The snapshots screen (`l`) now lists real snapshots; the catalog panel
-populates from `information_schema.tables`; queries actually return rows.
+populates from `duckdb_tables()` / `duckdb_views()`; queries actually
+return rows.
 
 ### 3. A real Quack server (using DuckDB's built-in `quack` extension)
 
@@ -155,10 +164,11 @@ In another terminal, launch Pintail and add a Quack connection:
 - Host: `localhost`,  Port: `9494`,  Token: *(paste the auth_token)*,  TLS: `n`
 - `enter` to save
 
-The connection chip flips from `× offline` to `● online`, the sessions
-panel populates from `duckdb_connections()` on the server, and the
-catalog tree shows the real tables. The scratchpad now runs queries via
-HTTP to the Quack server.
+The connection chip flips from `× offline` to `● online`, the sessions panel
+lists the server's live sessions from `quack_active_connections()` — id, state,
+and the SQL each one is running — and the catalog tree shows the real tables.
+The scratchpad runs queries through the local `duckdb` binary, which speaks the
+Quack protocol; Pintail does not implement the wire format itself.
 
 **For external access**, bind to a non-local interface and front with a
 TLS-terminating reverse proxy:
@@ -168,9 +178,22 @@ CALL quack_serve('quack:0.0.0.0:9494', allow_other_hostname => true);
 ```
 
 Pintail's **TLS config** screen (`x`) generates ready-to-deploy Caddy /
-Nginx / Envoy configs with the `h2c` upgrade Quack needs. The **Auth
-policy** screen (`p`) manages per-token grants via `ALTER SECRET`. For
-the full security model see the
+Nginx / Envoy configs following the [Quack reverse-proxy
+guide](https://duckdb.org/docs/current/quack/setup/reverse_proxy): HTTP/1.1
+upstream with keep-alive (the server speaks plain HTTP only), unbuffered
+responses so streamed `FETCH`es pass straight through, a 256 MB body cap for
+`PREPARE`/`APPEND`, and timeouts long enough for a query that sits between
+fetches for minutes.
+
+The **Auth policy** screen (`p`) generates Quack's authorization hook — a
+`(connection_id, query) → BOOLEAN` macro plus
+`SET GLOBAL quack_authorization_function` — from the permission toggles, and
+applies it on the server via `quack_query`. Two limits the screen states rather
+than hides: the hook is **per server, not per token** (scoping to one token
+needs an authentication hook recording `connection_id` → user), and prefix
+matching over statement text is not airtight — `WITH x AS (…) INSERT …` begins
+with `WITH` yet still writes. For real read-only enforcement, attach read-only
+or inspect the parsed statement type. See the
 [Quack security docs](https://duckdb.org/docs/current/quack/security).
 
 ### Bootstrapping the config file directly
@@ -197,8 +220,8 @@ query routing, and metadata fetch accordingly.
 
 | Type       | Use it for                          | Reachability                     | Query routing                                                                                                          |
 |------------|-------------------------------------|----------------------------------|------------------------------------------------------------------------------------------------------------------------|
-| `quack`    | Remote DuckDB via Quack             | TCP `host:port`                  | `ATTACH 'quack://…' AS _remote (TOKEN '…'); USE _remote;`                                                              |
-| `local`    | Plain `.duckdb` file on disk        | `os.Stat(path)`                  | `duckdb <path> -json -c "<sql>"` (file opened directly via argv)                                                       |
+| `quack`    | Remote DuckDB via Quack             | `GET /` banner check             | `ATTACH 'quack://…' AS _remote (TOKEN '…', DISABLE_SSL …); USE _remote;`                                                |
+| `local`    | Plain `.duckdb` file on disk        | `os.Stat(path)`                  | `duckdb <path> -json -c "<sql>"` (file opened directly via argv; a `storage_secret_ref` is prepended as `CREATE SECRET`) |
 | `ducklake` | DuckLake lakehouse                  | TCP dial of catalog host / stat  | `INSTALL ducklake; LOAD ducklake; ATTACH 'ducklake:…' AS _lake (DATA_PATH '…'); USE _lake;`                            |
 
 ### DuckLake catalog via another connection (multi-writer pattern)
@@ -232,12 +255,13 @@ or a bare path to a `.duckdb` or `.sqlite` file (extension-based detection).
 
 | Screen                  | Key | What it does                                                                                                            |
 |-------------------------|-----|-------------------------------------------------------------------------------------------------------------------------|
-| **Dashboard**           | —   | Live ping status for every connection, sessions table, catalog tree                                                     |
+| **Dashboard**           | —   | Live ping status for every connection; sessions and catalog for the selected one (`[`/`]` or `1`–`9` to switch)          |
 | **Secrets**             | `t` | Two modes (toggle with `tab`): **Quack tokens** for server auth, **Storage secrets** for object-store credentials       |
 | **SQL scratchpad**      | `s` | Quick verification queries; **CSV / Parquet export** via `ctrl+e` (for audit trails, not analytics)                     |
 | **DuckLake snapshots**  | `l` | List `<catalog>.snapshots()`; renders time-travel and `ducklake_expire_snapshots` SQL                                   |
 | **TLS config**          | `x` | Generate Caddy / Nginx / Envoy reverse-proxy configs for HTTPS termination                                              |
-| **Auth policy**         | `p` | Toggle per-token SQL permissions; emit `ALTER SECRET` statements                                                        |
+| **Auth policy**         | `p` | Toggle SQL permissions (saved back to the token list); generate and apply Quack's authorization hook macro               |
+| **Message log**         | `L` | Read the server's Quack request log: message type, connection id, duration, and the SQL of each request                  |
 | **Connections**         | `a` | Add, edit, delete connections; persisted to `~/.duckdb/pintail.json`                                                   |
 
 ### Storage secrets
@@ -248,6 +272,12 @@ The secrets screen (`t`) has two modes — `tab` toggles between them:
 - **Storage secrets** — credentials for object stores (S3 / R2 / GCS / Azure)
 
 Storage secrets are needed whenever DuckDB has to reach over the network to read data — almost always for `ducklake` connections (the `storage_path` is usually remote), and optionally for `local` connections when the database file path is itself a URI (`s3://bucket/db.duckdb`) or queries reach remote Parquet. `quack` connections don't use them; the Quack server has its own credentials.
+
+A `local` connection whose path is a URI is attached read-only after the
+secret is created (`ATTACH 's3://…' AS _local (READ_ONLY)`), since the
+credential has to exist before the database can be opened. Such paths can't be
+stat'd, so they are shown as `◍ remote path · not probed` rather than pinged —
+the first query reports any real problem with the path or credentials.
 
 A connection references a storage secret by name:
 
@@ -273,7 +303,7 @@ USE _lake;
 -- your query
 ```
 
-Secrets are stored in plaintext under `storage_secrets` in `~/.duckdb/pintail.json` — file permissions are your responsibility. For real key management, paste values from Vault / 1Password / your secret store; Pintail doesn't try to be one.
+Secrets are stored in plaintext under `storage_secrets` in `~/.duckdb/pintail.json`, and Quack tokens under `tokens` in the same file. Pintail writes it `0600` inside a `0700` directory; beyond that, file permissions are your responsibility. For real key management, paste values from Vault / 1Password / your secret store; Pintail doesn't try to be one.
 
 ### DuckLake snapshots
 
@@ -286,6 +316,41 @@ returned, plus two ready-to-paste SQL blocks:
 
 Neither is run from this screen by design; you copy the SQL into the
 scratchpad (or your tool of choice) to actually execute.
+
+### Running queries
+
+`ctrl+r` runs the buffer against the selected target. While a query is in
+flight, `ctrl+c` (the psql convention) or `esc` interrupts it — the `duckdb`
+subprocess is killed with it — instead of the only escape being to kill
+Pintail. Each query also has a deadline, 30s by default and overridable:
+
+```bash
+PINTAIL_QUERY_TIMEOUT=120 pintail    # seconds
+```
+
+Results are rendered to fit the terminal. Columns that don't fit are dropped
+from the right and the count is reported under the table (`+ 2 more columns`),
+so a wide result never looks complete when it isn't. Column widths are measured
+in terminal cells, so CJK text and emoji line up.
+
+### Message log
+
+`L` opens the server's Quack request log, read from
+`duckdb_logs_parsed('Quack')` on the server itself (via `quack_query`, since the
+log lives where the messages were handled). Each row is one protocol message:
+its type (`PREPARE_REQUEST`, `FETCH_REQUEST`, …), the server-issued connection
+id, the round-trip duration in milliseconds, the response type, and the SQL for
+requests that carry it. Failed messages are highlighted, and the panel below
+shows the selected entry in full — including the error, which has no column.
+
+Logging is **off until it is turned on**, and turning it on changes state on
+someone's server, so Pintail never does it as part of a poll: press `e` to run
+`CALL enable_logging('Quack')` on the target, then `r` to refresh. Pintail's own
+log-reading query is filtered out of the results.
+
+If the fetch fails with `structured_log_schema: 'Quack' not found`, the log type
+is not registered on that instance — it appears once the `quack` extension is
+loaded there.
 
 ### Scratchpad export
 
@@ -305,6 +370,12 @@ deletion is blocked to prevent lockout), `→` returns to the form. Any
 save/delete rebuilds all in-memory clients so DuckLake `catalog_ref`
 lookups always see the latest state.
 
+Saving is refused, with the reason shown under the form, when a name is
+already taken (names are how `catalog_ref`, the CLI subcommands and the
+scratchpad target list find a connection, so duplicates make the second one
+unreachable), when a `catalog_ref` or `storage_secret_ref` names something
+that doesn't exist, or when a DuckLake names itself as its own catalog.
+
 ## CLI subcommands
 
 Inspired by [msgvault](https://github.com/kenn-io/msgvault), Pintail
@@ -319,34 +390,106 @@ pintail ping prod-quack            # one-shot reachability check
 pintail ping lake-prod --json      # exit code + JSON
 pintail query lake-prod "SELECT * FROM orders LIMIT 5"
 pintail query lake-prod "SELECT COUNT(*) FROM orders" --json
+pintail version                    # print the version
 pintail help
 ```
 
-`query` requires `duckdb` on `$PATH` and uses the same type-aware
-routing as the scratchpad — including `catalog_ref` resolution.
+`query` uses the same type-aware routing as the scratchpad — including
+`catalog_ref` resolution and storage secrets. A `quack` connection is reachable
+over HTTP without a `duckdb` binary; `local` and `ducklake` connections need
+the CLI, and say so if it's missing.
 
 ## Polling cadence
 
 Three independent timers keep subprocess spawning under control:
 
-- **Ping** (5s) — cheap reachability check (TCP dial or file stat). No subprocess.
-- **Sessions** (15s) — refreshes sessions/snapshots for *online* connections.
+- **Ping** (5s) — cheap reachability check, no subprocess: an HTTP `GET /` for
+  `quack` (which also confirms a Quack server answered, not merely that
+  something holds the port), a file stat for `local`, a TCP dial or stat for a
+  `ducklake` catalog. A `local` connection whose path is a remote URI is not
+  probed at all.
+- **Sessions** (15s) — refreshes sessions/snapshots for *online* connections. For
+  `quack`, the server's own `quack_active_connections()` is run remotely through
+  `quack_query`, since the function reports on whichever process evaluates it.
 - **Catalog** — fetched once on each offline→online transition, plus on demand via `r`.
+
+Every result is stored against the connection that produced it, so polls from
+several servers don't overwrite each other, and both dashboard panels name the
+connection they're describing. A failed refresh keeps the last known-good
+listing and shows the backend's error above it rather than blanking the panel.
+
+## Verified against
+
+Pintail generates SQL and proxy configuration for a protocol that is still
+changing, so the checks behind it are worth naming. The behaviour below was
+verified against:
+
+| Component | Version | How |
+|-----------|---------|-----|
+| DuckDB CLI | `v1.5.5` (Variegata) | Queries run against a real binary — the integration tests do this in CI |
+| `duckdb-quack` | `main` @ `7e80f7f` (2026-07-20) | Extension sources read for the wire protocol, ATTACH options, SSL defaults, and `quack_active_connections()` |
+| `ducklake` | `main` @ `3d8e24a` (2026-08-13) | Sources read for `snapshots()`, `AT (VERSION => …)` and `ducklake_expire_snapshots` |
+| Quack docs | `docs/current/quack/*` | Overview, reference, security, and the reverse-proxy guide |
+
+What that means concretely:
+
+- **Executed against DuckDB 1.5.5**: the catalog query (`duckdb_tables()` /
+  `duckdb_views()`), the session-facts query, `enable_logging` /
+  `duckdb_logs_parsed`, and the scratchpad's own error and cancellation paths.
+  These are covered by tests that skip when `duckdb` is absent.
+- **Read from sources or docs, not executed**: everything that needs a running
+  Quack server or the `ducklake` extension — the `ATTACH … (TOKEN …,
+  DISABLE_SSL …)` form, `quack_query`, `quack_active_connections()`, the
+  authorization hook, and the DuckLake snapshot SQL. The extension host is
+  unreachable from the environment this was developed in, so these match the
+  published sources and docs but have not been round-tripped against a live
+  server.
+
+If you run Pintail against a newer Quack than the above and something breaks,
+the generated SQL in each screen is visible on screen for exactly that reason:
+copy it, adjust it, and open an issue.
 
 ## Building
 
 Requires Go 1.22+.
 
 ```bash
-unzip pintail-src.zip && cd pintail
-go mod tidy
+git clone https://github.com/CathalByrneGit/pintail
+cd pintail
 go build -o pintail .
 ./pintail
+```
+
+Or install straight from the module path:
+
+```bash
+go install github.com/CathalByrneGit/pintail@latest
+```
+
+Stamp a version into the binary with ldflags (it defaults to the value in
+`version.go`, and `pintail version` prints it):
+
+```bash
+go build -ldflags "-X main.version=$(git describe --tags --always)" -o pintail .
 ```
 
 For live queries, also install the DuckDB CLI: `duckdb` needs to be on
 `$PATH`. For DuckLake, ensure the `ducklake` extension installs
 (DuckDB ≥ 1.3.0).
+
+## Tests
+
+```bash
+go test ./...                # unit tests
+go test -race ./...           # what CI runs
+```
+
+Tests that talk to a real database skip themselves unless `duckdb` is on
+`$PATH` — they are the ones that catch generated SQL referencing columns or
+functions that don't exist, so it's worth having the CLI installed when
+running them locally. CI (`.github/workflows/ci.yml`) installs a pinned DuckDB,
+runs `gofmt`/`vet`/`build`/`test -race` against the Go floor and current
+stable, and fails if the integration tests silently skipped.
 
 ## Configuration
 
@@ -361,32 +504,49 @@ For live queries, also install the DuckDB CLI: `duckdb` needs to be on
   ],
   "storage_secrets": [
     { "name": "lake_s3", "type": "s3", "key_id": "AKIA…", "secret": "…", "region": "us-east-1", "scope": "s3://datalake-prod/lake" }
+  ],
+  "tokens": [
+    { "name": "etl_pipeline_prod", "value": "qk_…", "scope": ["analytics"], "permissions": ["SELECT"], "active": true }
   ]
 }
 ```
 
-Legacy configs without a `type` field default to `quack` for back-compat.
+Legacy configs without a `type` field default to `quack` for back-compat, and
+a file without a `tokens` or `storage_secrets` section loads fine — each
+section is written independently and the others are preserved.
+
+The file is written atomically (temp file + rename) with mode `0600`, and its
+directory `0700`: it holds bearer tokens and cloud credentials in plaintext.
+Saving one section re-reads the file first, so a token edit cannot drop a
+connection you added in the meantime.
+
+### Environment
+
+- `PINTAIL_QUERY_TIMEOUT` — per-query deadline in seconds (default 30). Values
+  that aren't a positive integer are ignored.
 
 Other files written under `~/.duckdb/`:
 
 - `pintail_tokens.sql` — exported `CREATE SECRET` statements for Quack tokens (`e` in tokens mode)
 - `pintail_storage_secrets.sql` — exported `CREATE SECRET` statements for storage credentials (`e` in secrets mode)
-- `tls/pintail-{Caddyfile,nginx.conf,envoy.yaml}` — exported proxy configs (`e` in TLS screen)
+- `tls/pintail-{Caddyfile,nginx.conf,envoy.yaml}` — exported proxy configs (`ctrl+s` in TLS screen)
 - `exports/pintail-{ts}.{csv,parquet}` — scratchpad audit exports (`ctrl+e`)
 
 ## Keybindings
 
-**Dashboard:** `q` quit · `tab` switch panel · `↑↓` navigate · `r` refresh · `t` tokens · `s` sql · `l` lake · `x` tls · `p` auth · `a` conn
+**Dashboard:** `q` quit · `tab` switch panel · `↑↓` navigate · `[`/`]` or `1`–`9` select connection · `r` refresh · `t` tokens · `s` sql · `l` lake · `L` logs · `x` tls · `p` auth · `a` conn
 
 **Secrets manager (`t`):** `tab` switch mode<span></span>· in **Quack tokens** mode: `↑↓` select · `n` new · `r` rotate · `d` revoke · `v` reveal · `e` export · `esc` back<span></span>· in **Storage secrets** mode: `↑↓` select · `n` new · `d` delete · `v` reveal · `e` export · `←→` cycle secret type in form · `esc` back
 
-**SQL scratchpad:** `ctrl+r` run · `ctrl+p`/`ctrl+n` history · `ctrl+e` export · `pgup`/`pgdn` scroll · `ctrl+l` clear · `tab` cycle target · `esc` back
+**SQL scratchpad:** `ctrl+r` run · `ctrl+c`/`esc` interrupt a running query · `ctrl+p`/`ctrl+n` history · `ctrl+e` export · `pgup`/`pgdn` scroll · `ctrl+l` clear · `tab` cycle target · `esc` back
 
 **DuckLake snapshots:** `↑↓` select · `r` refresh · `tab` cycle lake (if many) · `esc` back
 
-**TLS config:** `↑↓` field · `tab` proxy type · `pgup`/`pgdn` scroll · `e` save · `esc` back
+**Message log (`L`):** `↑↓` select · `r` refresh · `e` enable logging on the server · `tab` cycle server (if many) · `esc` back
 
-**Auth policy:** `↑↓` select · `tab` switch panel · `space` toggle · `a` apply · `esc` back
+**TLS config:** `↑↓` field · `tab` proxy type · `pgup`/`pgdn` scroll · `ctrl+s` save · `esc` back
+
+**Auth policy:** `↑↓` select · `tab` switch panel · `space` toggle · `a` apply · `T` cycle apply target · `esc` save & back
 
 **Connections (`a`):** `↑↓`/`tab` field · `←→`/`space` cycle type · `enter` advance/save · `esc` cancel; on the list panel: `e` edit · `d` delete · `→` back to form
 
@@ -403,8 +563,11 @@ pintail/
 ├── tokens.go      — Quack token manager (mode 1 of the secrets screen)
 ├── secrets.go     — Storage secret manager (mode 2 of the secrets screen)
 ├── ducklake.go    — snapshots view, time-travel / expire-snapshots SQL
+├── logs.go        — Quack message-log view
 ├── tls.go         — Caddy / Nginx / Envoy config generators
-└── auth.go        — per-token permission grid + ALTER SECRET generator
+├── auth.go        — permission grid + Quack authorization-hook generator
+├── version.go     — version string, stampable with -ldflags
+└── .github/workflows/ci.yml — fmt / vet / build / test -race, with a real duckdb
 ```
 
 ## Architecture notes
