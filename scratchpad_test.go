@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -268,6 +270,83 @@ func TestHrule(t *testing.T) {
 	for _, tc := range tests {
 		if got := hrule(tc.n); got != tc.want {
 			t.Errorf("hrule(%d) = %q, want %q", tc.n, got, tc.want)
+		}
+	}
+}
+
+// Exports used to be named from a whole-second timestamp and written with
+// os.Create, so two exports in the same second silently overwrote each other —
+// easy to hit, since the CSV and Parquet keys sit next to each other.
+func TestExportPathDoesNotCollideWithinASecond(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home) // windows
+
+	seen := map[string]bool{}
+	for i := 0; i < 5; i++ {
+		path, err := exportPath("csv")
+		if err != nil {
+			t.Fatalf("exportPath: %v", err)
+		}
+		if seen[path] {
+			t.Fatalf("exportPath returned %q twice; the earlier export would be overwritten", path)
+		}
+		seen[path] = true
+		// exportPath only reserves a name by checking the filesystem, so the
+		// caller creating the file is what makes the next call pick a new one.
+		if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+			t.Fatalf("writing %s: %v", path, err)
+		}
+	}
+}
+
+// A result export holds whatever the query returned. The connection file and
+// token store are kept at 0600; an export left at 0644 was the odd one out.
+func TestExportCSVIsNotWorldReadable(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix permission bits")
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	r := QueryResult{
+		Columns: []string{"id", "secret_value"},
+		Rows:    [][]string{{"1", "hunter2"}},
+	}
+	path, err := exportCSV(r)
+	if err != nil {
+		t.Fatalf("exportCSV: %v", err)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("export mode = %#o, want 0600", perm)
+	}
+
+	// And it must actually contain the rows.
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if got := string(body); !strings.Contains(got, "id,secret_value") || !strings.Contains(got, "1,hunter2") {
+		t.Errorf("export body = %q, want the header and row", got)
+	}
+}
+
+// The export prompt is where the user chooses between serialising the rows on
+// screen and re-running the query on the backend. Those differ for a volatile
+// table, so the prompt has to say which is which.
+func TestExportPromptDistinguishesTheTwoFormats(t *testing.T) {
+	sp := NewScratchpad(nil, nil)
+	sp.exportPrompt = true
+
+	got := sp.ViewResultsStatus()
+	for _, want := range []string{"rows shown", "re-runs query"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("export prompt is missing %q: %s", want, got)
 		}
 	}
 }

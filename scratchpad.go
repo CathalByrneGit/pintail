@@ -433,9 +433,14 @@ func (sp Scratchpad) ViewEditor() string {
 
 func (sp Scratchpad) ViewResultsStatus() string {
 	if sp.exportPrompt {
+		// The two formats are not the same operation and the difference can
+		// change what lands in the file: CSV serialises the rows on screen,
+		// while Parquet re-runs the query on the backend, so a non-deterministic
+		// or concurrently-modified query can produce different data. Say so
+		// here — this is the moment the user picks between them.
 		return "  " + labelStyle.Render("export as:") +
-			"  " + keyBadge("c") + " CSV" +
-			"  " + keyBadge("p") + " Parquet" +
+			"  " + keyBadge("c") + " CSV " + mutedStyle.Render("(rows shown)") +
+			"  " + keyBadge("p") + " Parquet " + mutedStyle.Render("(re-runs query)") +
 			"  " + keyBadge("esc") + " cancel"
 	}
 	if sp.exportMsg != "" {
@@ -726,7 +731,12 @@ func exportCSV(r QueryResult) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	f, err := os.Create(path)
+	// 0600, not os.Create's 0666&umask. An export holds whatever the query
+	// returned, which for an admin console is as sensitive as the connection
+	// file we already keep at 0600; leaving it 0644 was the odd one out.
+	// O_EXCL because exportPath promises an unused name — if that is somehow
+	// wrong, fail rather than overwrite someone's export.
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return "", err
 	}
@@ -747,6 +757,11 @@ func exportCSV(r QueryResult) (string, error) {
 // exportParquet uses the duckdb CLI to re-execute the query and write the
 // output as Parquet via COPY (...) TO. This is the easiest way to get a
 // proper Parquet file from a Go process without CGo.
+//
+// Note the difference from exportCSV, which serialises the rows already on
+// screen: this runs the query again, so the file reflects the backend now
+// rather than at the time the result was fetched. The export prompt labels both
+// options with that distinction, because for a volatile table they differ.
 func exportParquet(c *QuackClient, sql string) (string, error) {
 	if c == nil || !c.HasCLI() {
 		return "", fmt.Errorf("duckdb CLI not available")
@@ -775,15 +790,33 @@ func exportParquet(c *QuackClient, sql string) (string, error) {
 
 // exportPath constructs a timestamped path under ~/.duckdb/exports/ and
 // ensures the directory exists.
+//
+// The timestamp only has second resolution, so two exports in the same second
+// used to land on the same name and the first was silently overwritten — easy
+// to hit with the two export keys next to each other on the keyboard. When the
+// name is taken, a -2, -3, … suffix is appended instead.
 func exportPath(ext string) (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		home = "/tmp"
+		home = os.TempDir()
 	}
 	dir := filepath.Join(home, ".duckdb", "exports")
-	if err := os.MkdirAll(dir, 0750); err != nil {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return "", err
 	}
-	name := fmt.Sprintf("pintail-%s.%s", time.Now().Format("20060102-150405"), ext)
-	return filepath.Join(dir, name), nil
+
+	stamp := time.Now().Format("20060102-150405")
+	for n := 1; n <= 1000; n++ {
+		name := fmt.Sprintf("pintail-%s.%s", stamp, ext)
+		if n > 1 {
+			name = fmt.Sprintf("pintail-%s-%d.%s", stamp, n, ext)
+		}
+		path := filepath.Join(dir, name)
+		if _, err := os.Lstat(path); os.IsNotExist(err) {
+			return path, nil
+		} else if err != nil {
+			return "", err
+		}
+	}
+	return "", fmt.Errorf("too many exports in the same second under %s", dir)
 }
