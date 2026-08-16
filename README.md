@@ -45,7 +45,7 @@ binary; shells out to the `duckdb` CLI for live operations.
 ```
 🦆 Pintail  ─  DuckDB Quack Protocol Manager  v0.1.0
 ─────────────────────────────────────────────────────────────────────────
-▸ 1:● central-catalog [quack]   quack://catalog:9494             12ms
+▸ 1:● central-catalog [quack]   quack:catalog:9494               12ms
   2:● lake-prod [ducklake]      ducklake:→central-catalog  →  s3:…  18ms
   3:● local-dev [local]         file:/data/analytics.duckdb          1ms
 
@@ -72,7 +72,7 @@ exploration work, reach for Harlequin or DuckDB's local UI.
 ## Getting started — a real setup
 
 Pintail ships with **no mock data**. The default config has one stub
-connection (`localhost` → `quack://localhost:9494`) that won't connect to
+connection (`localhost` → `quack:localhost:9494`) that won't connect to
 anything until you stand up a real backend behind it. The dashboard's
 "active connections" panel and DuckLake catalog panel will be empty until
 that happens — which is honest, not broken.
@@ -234,7 +234,7 @@ query routing, and metadata fetch accordingly.
 
 | Type       | Use it for                          | Reachability                     | Query routing                                                                                                          |
 |------------|-------------------------------------|----------------------------------|------------------------------------------------------------------------------------------------------------------------|
-| `quack`    | Remote DuckDB via Quack             | `GET /` banner check             | `ATTACH 'quack://…' AS _remote (TOKEN '…', DISABLE_SSL …); USE _remote;`                                                |
+| `quack`    | Remote DuckDB via Quack             | `GET /` banner check             | `CREATE OR REPLACE SECRET … (TYPE quack, TOKEN '…', SCOPE 'quack:host:port'); ATTACH 'quack:host:port' AS _remote; USE _remote;` |
 | `local`    | Plain `.duckdb` file on disk        | `os.Stat(path)`                  | `duckdb <path> -json -c "<sql>"` (file opened directly via argv; a `storage_secret_ref` is prepended as `CREATE SECRET`) |
 | `ducklake` | DuckLake lakehouse                  | TCP dial of catalog host / stat  | `INSTALL ducklake; LOAD ducklake; ATTACH 'ducklake:…' AS _lake (DATA_PATH '…'); USE _lake;`                            |
 
@@ -254,7 +254,8 @@ Pintail emits the two-step attach automatically:
 
 ```sql
 INSTALL ducklake; LOAD ducklake;
-ATTACH 'quack://catalog.internal:9494' AS _catalog (TOKEN 'qk_…');
+CREATE OR REPLACE SECRET _quack_catalog (TYPE quack, TOKEN 'qk_…', SCOPE 'quack:catalog.internal:9494');
+ATTACH 'quack:catalog.internal:9494' AS _catalog;
 ATTACH 'ducklake:_catalog' AS _lake (DATA_PATH 's3://datalake-prod/lake');
 USE _lake;
 ```
@@ -311,7 +312,8 @@ Pintail injects the `CREATE SECRET` ahead of the ATTACH automatically:
 INSTALL httpfs; LOAD httpfs;
 CREATE OR REPLACE SECRET _storage (TYPE s3, KEY_ID '…', SECRET '…', REGION 'us-east-1', SCOPE 's3://datalake-prod/lake');
 INSTALL ducklake; LOAD ducklake;
-ATTACH 'quack://catalog.internal:9494' AS _catalog (TOKEN 'qk_…');
+CREATE OR REPLACE SECRET _quack_catalog (TYPE quack, TOKEN 'qk_…', SCOPE 'quack:catalog.internal:9494');
+ATTACH 'quack:catalog.internal:9494' AS _catalog;
 ATTACH 'ducklake:_catalog' AS _lake (DATA_PATH 's3://datalake-prod/lake');
 USE _lake;
 -- your query
@@ -449,7 +451,7 @@ verified against:
 What that means concretely:
 
 - **Executed against a live Quack server** (the `live-quack` CI job): the
-  `ATTACH … (TOKEN …, DISABLE_SSL …)` form, query execution and error
+  `CREATE SECRET (TYPE quack, …)` + `ATTACH` form, query execution and error
   reporting through it, the catalog listing, `quack_active_connections()` via
   `quack_query`, `enable_logging` plus the columns of
   `duckdb_logs_parsed('Quack')`, the authorization hook's read-back / install /
@@ -468,16 +470,31 @@ is **not** a security boundary — `WITH x AS (…) INSERT …` passes as a read
 screen says so, and DuckLake or a read-only ATTACH is the real mechanism.
 
 **On reading sources versus running them.** Those are not the same check, and
-the difference has bitten this project. `DISABLE_SSL` is a valid `ATTACH` option
-in duckdb-quack `main` — it went in with the commit pinned above — but not in the
-build published for DuckDB v1.5.5, which is what `INSTALL quack` actually gives
-you. Pintail emitted it on every Quack connection, so every Quack connection
-failed with `Binder Error: Unrecognized option for attach "disable_ssl"`. The
-source said the option existed; the extension people install disagreed. The
-`live-quack` job is there so the next such gap is found by CI rather than by
-you. Pintail now sends the option only when it differs from the extension's own
-default (plaintext for `localhost`/`127.0.0.1`/`::1`, SSL otherwise), so the
-common cases need no new-extension features at all.
+the difference bit this project twice in the same statement. Both `TOKEN` and
+`DISABLE_SSL` are valid `ATTACH` options in duckdb-quack `main` — they went in
+with the commit pinned above — and *neither* exists in the build published for
+DuckDB v1.5.5, which is what `INSTALL quack` actually gives you:
+
+```
+Binder Error: Unrecognized option for attach "disable_ssl"
+Binder Error: Unrecognized option for attach "token"
+```
+
+Every Quack connection Pintail made failed. The source said the options
+existed; the extension people install disagreed. So:
+
+- The token goes in a `quack` secret scoped to the URI, which is the older and
+  stable path (the extension's own `secret.test` uses it, and its client
+  resolves it with `LookupSecret(uri, "quack")`).
+- `DISABLE_SSL` is sent only when it differs from the extension's own default —
+  plaintext for `localhost`/`127.0.0.1`/`::1`, SSL otherwise — so the ordinary
+  cases need nothing new. Plaintext to a *non-local* host is the one
+  combination with no older spelling; on the v1.5.5 build it fails with the
+  Binder Error above, which is better than silently attempting TLS against a
+  server that is not speaking it.
+
+The `live-quack` job exists so the next gap of this kind is found by CI rather
+than by you.
 
 If you run Pintail against a newer Quack than the above and something breaks,
 the generated SQL in each screen is visible on screen for exactly that reason:
