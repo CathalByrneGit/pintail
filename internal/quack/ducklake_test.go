@@ -2,8 +2,10 @@ package quack
 
 import (
 	"context"
+	"fmt"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -141,10 +143,66 @@ func TestSnapshotsAgainstRealDuckLake(t *testing.T) {
 		t.Errorf("snapshots should be newest first, got %q then %q", snaps[0].ID, snaps[1].ID)
 	}
 
-	// And the generated time-travel statement has to actually run.
-	tt := TimeTravelSQL(cfg, snaps[len(snaps)-1].ID)
-	tt = strings.ReplaceAll(tt, "<table_name>", "orders")
-	if out, err := exec.Command("duckdb", "-no-init", "-c", tt).CombinedOutput(); err != nil {
-		t.Errorf("generated time-travel SQL does not run: %v\n%s\n--- SQL:\n%s", err, out, tt)
+	// The generated time-travel statement has to actually run, and reading an
+	// older snapshot has to return different data — otherwise the screen is
+	// offering a statement that does nothing.
+	//
+	// Snapshot 0 is the lake before any table exists, so time-travelling a table
+	// to it correctly fails with a Catalog Error. Walk newest-first and use the
+	// oldest snapshot at which the table is actually there.
+	newest := runTimeTravel(t, cfg, snaps[0].ID)
+	if newest != 150 {
+		t.Errorf("newest snapshot has %d rows, want 150 (100 created + 50 inserted)", newest)
 	}
+
+	var sawEarlier bool
+	for _, s := range snaps[1:] {
+		n, err := tryTimeTravel(cfg, s.ID)
+		if err != nil {
+			continue // predates the table, which is expected for snapshot 0
+		}
+		if n < newest {
+			sawEarlier = true
+			if n != 100 {
+				t.Errorf("snapshot %s has %d rows, want the 100 from before the insert", s.ID, n)
+			}
+			break
+		}
+	}
+	if !sawEarlier {
+		t.Error("no earlier snapshot returned fewer rows, so time travel is not doing anything")
+	}
+}
+
+// runTimeTravel runs the generated statement and fails the test if it does not.
+func runTimeTravel(t *testing.T, cfg ServerConfig, snapshotID string) int {
+	t.Helper()
+	n, err := tryTimeTravel(cfg, snapshotID)
+	if err != nil {
+		t.Fatalf("generated time-travel SQL does not run at snapshot %s: %v", snapshotID, err)
+	}
+	return n
+}
+
+// tryTimeTravel counts the rows the generated statement returns at snapshotID,
+// substituting a count for the placeholder SELECT so the result is checkable.
+func tryTimeTravel(cfg ServerConfig, snapshotID string) (int, error) {
+	sql := TimeTravelSQL(cfg, snapshotID)
+	sql = strings.Replace(sql,
+		"SELECT * FROM <table_name> AT (VERSION => "+snapshotID+");",
+		"SELECT count(*) AS n FROM orders AT (VERSION => "+snapshotID+");", 1)
+
+	out, err := exec.Command("duckdb", "-no-init", "-json", "-c", sql).CombinedOutput()
+	if err != nil {
+		return 0, fmt.Errorf("%s\n--- SQL:\n%s", strings.TrimSpace(string(out)), sql)
+	}
+	n, err := firstStringValue(out, "n")
+	if err != nil {
+		return 0, err
+	}
+	count, err := strconv.Atoi(n)
+	if err != nil {
+		return 0, fmt.Errorf("count %q is not a number: %w", n, err)
+	}
+	return count, nil
 }

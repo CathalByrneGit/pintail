@@ -98,6 +98,7 @@ jobs:
         # real DuckDB, so treat "everything skipped" as a failure.
         shell: bash
         run: |
+          set -o pipefail
           go test -run 'RealDuckDB' -v ./... | tee out.txt
           if ! grep -q -- '--- PASS: TestMetadataQueriesAgainstRealDuckDB' out.txt; then
             echo "The DuckDB integration test did not run."
@@ -201,7 +202,13 @@ jobs:
           exit 1
 
       - name: Test against the live server
-        run: go test -race -run 'TestLive' -v ./internal/quack/ | tee live.txt
+        # pipefail, or `go test | tee` reports tee's exit status and a failing
+        # test passes the step. The first run of this job did exactly that: six
+        # of seven live tests failed and only the confirm step below noticed.
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -race -run 'TestLive' -v ./internal/quack/ | tee live.txt
 
       - name: Confirm the live tests actually ran
         # These skip themselves when the environment is not set, so a

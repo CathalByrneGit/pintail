@@ -64,9 +64,9 @@ func TestAttachPrefix(t *testing.T) {
 			},
 		},
 		{
-			// The quack extension defaults SSL on for any non-local host, so a
-			// plaintext connection has to say so explicitly.
-			name: "quack attaches with its token and disables ssl",
+			// The extension defaults SSL on for any non-local host, so a
+			// plaintext connection to one has to say so explicitly.
+			name: "plaintext to a non-local host disables ssl",
 			cfg:  ServerConfig{Name: "q", Type: ConnQuack, Host: "h", Port: 9494, Token: "qk_tok"},
 			wantHas: []string{
 				"ATTACH 'quack://h:9494' AS _remote (TOKEN 'qk_tok', DISABLE_SSL true)",
@@ -74,12 +74,16 @@ func TestAttachPrefix(t *testing.T) {
 			},
 		},
 		{
-			name: "quack with TLS keeps ssl on",
+			// TLS to a non-local host is already the extension's default, so the
+			// option is omitted rather than restated. DISABLE_SSL as an ATTACH
+			// option postdates the extension build published for DuckDB v1.5.5,
+			// and emitting it unconditionally broke every Quack connection.
+			name: "TLS to a non-local host needs no option at all",
 			cfg:  ServerConfig{Name: "q", Type: ConnQuack, Host: "h", Port: 443, Token: "qk_tok", TLS: true},
 			wantHas: []string{
-				"ATTACH 'quack://h:443' AS _remote (TOKEN 'qk_tok', DISABLE_SSL false)",
+				"ATTACH 'quack://h:443' AS _remote (TOKEN 'qk_tok')",
 			},
-			wantNone: []string{"DISABLE_SSL true"},
+			wantNone: []string{"DISABLE_SSL"},
 		},
 		{
 			name: "ducklake with a catalog path",
@@ -392,5 +396,129 @@ func TestLocalWithSecretQueriesAgainstRealDuckDB(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("the _storage secret was not created; rows = %v", verify.Rows)
+	}
+}
+
+// The SSL option is the bug that broke every Quack connection, so the whole
+// matrix is pinned here.
+//
+// The extension decides for itself: QuackUri::IsLocal treats localhost,
+// 127.0.0.1 and ::1 as plaintext and everything else as SSL. Pintail emitted
+// DISABLE_SSL unconditionally, and that option only reached ATTACH in
+// duckdb-quack 7e80f7f — after the build published for DuckDB v1.5.5. So a
+// loopback connection, which is what the README's own walkthrough sets up,
+// failed with `Binder Error: Unrecognized option for attach "disable_ssl"`. The
+// rule now is to say something only when it differs from what the extension
+// would do unprompted.
+func TestSSLOptionOnlyAppearsWhenItChangesTheDefault(t *testing.T) {
+	tests := []struct {
+		name    string
+		host    string
+		tls     bool
+		wantOpt string // "" means no SSL option at all
+		whyItIs string
+	}{
+		{
+			name: "loopback plaintext is the extension's default",
+			host: "127.0.0.1", tls: false, wantOpt: "",
+			whyItIs: "IsLocal() is true, so SSL is already off",
+		},
+		{
+			name: "localhost plaintext is the extension's default",
+			host: "localhost", tls: false, wantOpt: "",
+			whyItIs: "IsLocal() is true, so SSL is already off",
+		},
+		{
+			name: "LOCALHOST is matched case-insensitively",
+			host: "LocalHost", tls: false, wantOpt: "",
+			whyItIs: "the extension lowercases the host before comparing",
+		},
+		{
+			name: "ipv6 loopback is local too",
+			host: "::1", tls: false, wantOpt: "",
+			whyItIs: "IsLocal() lists ::1",
+		},
+		{
+			name: "TLS on loopback is not the default and must be stated",
+			host: "127.0.0.1", tls: true, wantOpt: "DISABLE_SSL false",
+			whyItIs: "local defaults to plaintext, so SSL has to be asked for",
+		},
+		{
+			name: "TLS to a remote host is the default",
+			host: "quack.example.com", tls: true, wantOpt: "",
+			whyItIs: "non-local defaults to SSL",
+		},
+		{
+			name: "plaintext to a remote host must be stated",
+			host: "quack.example.com", tls: false, wantOpt: "DISABLE_SSL true",
+			whyItIs: "non-local defaults to SSL, so plaintext has to be asked for",
+		},
+		{
+			// A host that merely contains "localhost" is not loopback.
+			name: "a host containing localhost is not local",
+			host: "not-localhost.example.com", tls: true, wantOpt: "",
+			whyItIs: "IsLocal() compares the whole host, not a substring",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := ServerConfig{Name: "q", Type: ConnQuack, Host: tc.host, Port: 9494, Token: "tok", TLS: tc.tls}
+
+			attach := strings.Join(cfg.quackAttachOptions(), ", ")
+			query := strings.Join(cfg.quackQueryOptions(), ", ")
+
+			if tc.wantOpt == "" {
+				if strings.Contains(attach, "DISABLE_SSL") {
+					t.Errorf("ATTACH options = %q, want no SSL option (%s)", attach, tc.whyItIs)
+				}
+				if strings.Contains(query, "disable_ssl") {
+					t.Errorf("quack_query options = %q, want no SSL option (%s)", query, tc.whyItIs)
+				}
+				return
+			}
+
+			if !strings.Contains(attach, tc.wantOpt) {
+				t.Errorf("ATTACH options = %q, want %q (%s)", attach, tc.wantOpt, tc.whyItIs)
+			}
+			// The table function spells the same option as a named parameter.
+			wantQuery := strings.ToLower(strings.Replace(tc.wantOpt, " ", " = ", 1))
+			if !strings.Contains(query, wantQuery) {
+				t.Errorf("quack_query options = %q, want %q (%s)", query, wantQuery, tc.whyItIs)
+			}
+		})
+	}
+}
+
+// With neither a token nor an SSL override there is nothing to put in
+// parentheses, and `ATTACH '…' AS x ()` does not parse. The extension resolves a
+// `CREATE SECRET (TYPE quack, …)` when TOKEN is absent, so this is a real
+// configuration rather than a degenerate one.
+func TestAttachWithNoOptionsOmitsTheParentheses(t *testing.T) {
+	cfg := ServerConfig{Name: "q", Type: ConnQuack, Host: "localhost", Port: 9494}
+
+	if got := cfg.quackAttachOptions(); len(got) != 0 {
+		t.Fatalf("options = %v, want none for a tokenless loopback connection", got)
+	}
+
+	prefix := cfg.AttachPrefix(nil, nil)
+	if strings.Contains(prefix, "()") {
+		t.Errorf("empty parentheses in the prologue:\n%s", prefix)
+	}
+	if !strings.Contains(prefix, "ATTACH 'quack://localhost:9494' AS _remote;") {
+		t.Errorf("want a bare ATTACH, got:\n%s", prefix)
+	}
+	// An empty TOKEN would override the secret lookup with a blank credential.
+	if strings.Contains(prefix, "TOKEN ''") {
+		t.Errorf("an empty token was emitted:\n%s", prefix)
+	}
+
+	// Same for the quack_query call: no dangling comma.
+	sql := cfg.quackQuerySQL("SELECT 1")
+	if strings.Contains(sql, ", )") || strings.Contains(sql, ",)") {
+		t.Errorf("dangling comma in the quack_query call:\n%s", sql)
+	}
+	if !strings.Contains(sql, "quack_query('quack://localhost:9494', 'SELECT 1')") {
+		t.Errorf("want a two-argument call, got:\n%s", sql)
 	}
 }

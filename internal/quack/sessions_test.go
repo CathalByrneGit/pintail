@@ -111,9 +111,10 @@ func TestQuackSessionQueryShape(t *testing.T) {
 		t.Errorf("options = %q, want ssl disabled for a plaintext connection", opts)
 	}
 
+	// TLS to a non-local host is the extension's own default, so nothing is said.
 	tls := ServerConfig{Name: "p", Type: ConnQuack, Host: "h", Port: 443, Token: "t", TLS: true}
-	if got := strings.Join(tls.quackQueryOptions(), ", "); !strings.Contains(got, "disable_ssl = false") {
-		t.Errorf("options = %q, want ssl kept on for a TLS connection", got)
+	if got := strings.Join(tls.quackQueryOptions(), ", "); strings.Contains(got, "disable_ssl") {
+		t.Errorf("options = %q, want no ssl option when it matches the default", got)
 	}
 
 	// A quote in the token must not break out of the literal.

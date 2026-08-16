@@ -326,10 +326,7 @@ func (c ServerConfig) AttachPrefix(resolve ConfigResolver, resolveSecret SecretR
 				"ATTACH '%s' AS _local (READ_ONLY); USE _local; ", SQLQuote(c.Path)))
 		}
 	case ConnQuack:
-		b.WriteString(fmt.Sprintf(
-			"ATTACH '%s' AS _remote (%s); USE _remote; ",
-			c.QuackURI(), strings.Join(c.quackAttachOptions(), ", "),
-		))
+		b.WriteString(quackAttachStatement(c, "_remote") + "USE _remote; ")
 	case ConnDuckLake:
 		if c.CatalogRef != "" && resolve != nil {
 			if catCfg, ok := resolve(c.CatalogRef); ok {
@@ -358,12 +355,66 @@ func (c ServerConfig) AttachPrefix(resolve ConfigResolver, resolveSecret SecretR
 // on a private network — was being reached over https:// and failing, with the
 // connection's own TLS setting only ever used to pick a badge colour. Passing
 // the flag either way makes that setting mean what it says.
-func (c ServerConfig) quackAttachOptions() []string {
-	opts := []string{fmt.Sprintf("TOKEN '%s'", SQLQuote(c.Token))}
-	if c.TLS {
-		return append(opts, "DISABLE_SSL false")
+// quackAttachStatement renders ATTACH for a Quack URI under the given alias.
+//
+// The option list can legitimately be empty — no token (the extension resolves a
+// quack secret instead) and an SSL setting that matches the extension's own
+// default. An empty list must not become `ATTACH '…' AS x ()`, which does not
+// parse.
+func quackAttachStatement(c ServerConfig, alias string) string {
+	opts := c.quackAttachOptions()
+	if len(opts) == 0 {
+		return fmt.Sprintf("ATTACH '%s' AS %s; ", c.QuackURI(), alias)
 	}
-	return append(opts, "DISABLE_SSL true")
+	return fmt.Sprintf("ATTACH '%s' AS %s (%s); ",
+		c.QuackURI(), alias, strings.Join(opts, ", "))
+}
+
+func (c ServerConfig) quackAttachOptions() []string {
+	var opts []string
+
+	// Omit TOKEN entirely when there is none. The extension falls back to a
+	// `CREATE SECRET (TYPE quack, …)` scoped to the URI when the option is
+	// absent, which is the documented way to keep a token out of the statement;
+	// passing TOKEN '' instead overrides that with an empty credential.
+	if c.Token != "" {
+		opts = append(opts, fmt.Sprintf("TOKEN '%s'", SQLQuote(c.Token)))
+	}
+
+	if opt, ok := disableSSLOption(c, "DISABLE_SSL %t"); ok {
+		opts = append(opts, opt)
+	}
+	return opts
+}
+
+// quackHostIsLocal mirrors the extension's QuackUri::IsLocal, which is what
+// decides whether SSL is on by default.
+func quackHostIsLocal(host string) bool {
+	switch strings.ToLower(strings.Trim(host, "[]")) {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	}
+	return false
+}
+
+// disableSSLOption renders the SSL option only when it changes what the
+// extension would do unprompted, formatted with the given template.
+//
+// This is not a micro-optimisation. The extension already defaults to plaintext
+// for loopback and SSL for everything else, and DISABLE_SSL as an ATTACH option
+// only arrived in duckdb-quack 7e80f7f — after the build published for DuckDB
+// v1.5.5. Pintail emitted it unconditionally, so ATTACH failed with
+// `Binder Error: Unrecognized option for attach "disable_ssl"` on the extension
+// version people actually install, which is to say every Quack connection was
+// broken. Sending it only when it is needed makes the common loopback case work
+// on the released extension and leaves the option for the case that genuinely
+// requires it: plaintext to a non-local host.
+func disableSSLOption(c ServerConfig, format string) (string, bool) {
+	sslByDefault := !quackHostIsLocal(c.Host)
+	if c.TLS == sslByDefault {
+		return "", false
+	}
+	return fmt.Sprintf(format, !c.TLS), true
 }
 
 // quackQuerySQL wraps sql so the *server* runs it, via quack_query(). Anything
@@ -371,21 +422,26 @@ func (c ServerConfig) quackAttachOptions() []string {
 // active-connection list, an authorization policy — goes through here; running
 // it locally would either describe the wrong process or configure the wrong one.
 func (c ServerConfig) quackQuerySQL(sql string) string {
-	return fmt.Sprintf(
-		"INSTALL quack; LOAD quack; SELECT * FROM quack_query('%s', '%s', %s);",
-		SQLQuote(c.QuackURI()), SQLQuote(sql),
-		strings.Join(c.quackQueryOptions(), ", "),
-	)
+	call := fmt.Sprintf("quack_query('%s', '%s'", SQLQuote(c.QuackURI()), SQLQuote(sql))
+	// The named parameters are optional, and an empty list must not leave a
+	// dangling comma inside the call.
+	if opts := c.quackQueryOptions(); len(opts) > 0 {
+		call += ", " + strings.Join(opts, ", ")
+	}
+	return fmt.Sprintf("INSTALL quack; LOAD quack; SELECT * FROM %s);", call)
 }
 
 // quackQueryOptions renders the named parameters for quack_query(), which take
 // `name = value` form rather than the bare option list ATTACH uses.
 func (c ServerConfig) quackQueryOptions() []string {
-	opts := []string{fmt.Sprintf("token = '%s'", SQLQuote(c.Token))}
-	if c.TLS {
-		return append(opts, "disable_ssl = false")
+	var opts []string
+	if c.Token != "" {
+		opts = append(opts, fmt.Sprintf("token = '%s'", SQLQuote(c.Token)))
 	}
-	return append(opts, "disable_ssl = true")
+	if opt, ok := disableSSLOption(c, "disable_ssl = %t"); ok {
+		opts = append(opts, opt)
+	}
+	return opts
 }
 
 // buildCatalogAttach renders just the ATTACH ... AS _catalog statement for a
@@ -393,10 +449,7 @@ func (c ServerConfig) quackQueryOptions() []string {
 func buildCatalogAttach(catCfg ServerConfig) string {
 	switch catCfg.Type {
 	case ConnQuack:
-		return fmt.Sprintf(
-			"ATTACH '%s' AS _catalog (%s); ",
-			catCfg.QuackURI(), strings.Join(catCfg.quackAttachOptions(), ", "),
-		)
+		return quackAttachStatement(catCfg, "_catalog")
 	case ConnLocal:
 		return fmt.Sprintf("ATTACH '%s' AS _catalog; ", SQLQuote(catCfg.Path))
 	default:
