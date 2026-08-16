@@ -69,9 +69,13 @@ func TestAttachPrefix(t *testing.T) {
 			name: "plaintext to a non-local host disables ssl",
 			cfg:  ServerConfig{Name: "q", Type: ConnQuack, Host: "h", Port: 9494, Token: "qk_tok"},
 			wantHas: []string{
-				"ATTACH 'quack://h:9494' AS _remote (TOKEN 'qk_tok', DISABLE_SSL true)",
+				"INSTALL quack; LOAD quack;",
+				"CREATE OR REPLACE SECRET _quack_remote (TYPE quack, TOKEN 'qk_tok', SCOPE 'quack:h:9494')",
+				"ATTACH 'quack:h:9494' AS _remote (DISABLE_SSL true)",
 				"USE _remote",
 			},
+			// TOKEN is not an ATTACH option in the published extension build.
+			wantNone: []string{"AS _remote (TOKEN"},
 		},
 		{
 			// TLS to a non-local host is already the extension's default, so the
@@ -81,7 +85,8 @@ func TestAttachPrefix(t *testing.T) {
 			name: "TLS to a non-local host needs no option at all",
 			cfg:  ServerConfig{Name: "q", Type: ConnQuack, Host: "h", Port: 443, Token: "qk_tok", TLS: true},
 			wantHas: []string{
-				"ATTACH 'quack://h:443' AS _remote (TOKEN 'qk_tok')",
+				"CREATE OR REPLACE SECRET _quack_remote (TYPE quack, TOKEN 'qk_tok', SCOPE 'quack:h:443')",
+				"ATTACH 'quack:h:443' AS _remote;",
 			},
 			wantNone: []string{"DISABLE_SSL"},
 		},
@@ -100,7 +105,8 @@ func TestAttachPrefix(t *testing.T) {
 				CatalogRef: "central", StoragePath: "s3://bucket/lake", StorageSecretRef: "lake_s3"},
 			wantHas: []string{
 				"CREATE OR REPLACE SECRET _storage",
-				"ATTACH 'quack://catalog.internal:9494' AS _catalog (TOKEN 'qk_tok', DISABLE_SSL true)",
+				"CREATE OR REPLACE SECRET _quack_catalog (TYPE quack, TOKEN 'qk_tok', SCOPE 'quack:catalog.internal:9494')",
+				"ATTACH 'quack:catalog.internal:9494' AS _catalog (DISABLE_SSL true)",
 				"ATTACH 'ducklake:_catalog' AS _lake (DATA_PATH 's3://bucket/lake')",
 			},
 		},
@@ -189,7 +195,7 @@ func TestInvocation(t *testing.T) {
 			name:         "quack is reached through the prologue only",
 			cfg:          ServerConfig{Type: ConnQuack, Host: "h", Port: 9494},
 			wantPosition: "",
-			wantScriptIn: []string{"ATTACH 'quack://h:9494'"},
+			wantScriptIn: []string{"ATTACH 'quack:h:9494'"},
 		},
 	}
 
@@ -505,12 +511,12 @@ func TestAttachWithNoOptionsOmitsTheParentheses(t *testing.T) {
 	if strings.Contains(prefix, "()") {
 		t.Errorf("empty parentheses in the prologue:\n%s", prefix)
 	}
-	if !strings.Contains(prefix, "ATTACH 'quack://localhost:9494' AS _remote;") {
+	if !strings.Contains(prefix, "ATTACH 'quack:localhost:9494' AS _remote;") {
 		t.Errorf("want a bare ATTACH, got:\n%s", prefix)
 	}
-	// An empty TOKEN would override the secret lookup with a blank credential.
-	if strings.Contains(prefix, "TOKEN ''") {
-		t.Errorf("an empty token was emitted:\n%s", prefix)
+	// No token means no secret at all, rather than one with an empty credential.
+	if strings.Contains(prefix, "SECRET") {
+		t.Errorf("a secret was created for a tokenless connection:\n%s", prefix)
 	}
 
 	// Same for the quack_query call: no dangling comma.
@@ -518,7 +524,7 @@ func TestAttachWithNoOptionsOmitsTheParentheses(t *testing.T) {
 	if strings.Contains(sql, ", )") || strings.Contains(sql, ",)") {
 		t.Errorf("dangling comma in the quack_query call:\n%s", sql)
 	}
-	if !strings.Contains(sql, "quack_query('quack://localhost:9494', 'SELECT 1')") {
+	if !strings.Contains(sql, "quack_query('quack:localhost:9494', 'SELECT 1')") {
 		t.Errorf("want a two-argument call, got:\n%s", sql)
 	}
 }

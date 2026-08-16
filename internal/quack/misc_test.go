@@ -56,7 +56,7 @@ func TestDisplayURIPerType(t *testing.T) {
 		cfg  ServerConfig
 		want string
 	}{
-		{"quack", ServerConfig{Type: ConnQuack, Host: "h", Port: 9494}, "quack://h:9494"},
+		{"quack", ServerConfig{Type: ConnQuack, Host: "h", Port: 9494}, "quack:h:9494"},
 		{"local", ServerConfig{Type: ConnLocal, Path: "/d/a.duckdb"}, "/d/a.duckdb"},
 		{"ducklake by path", ServerConfig{Type: ConnDuckLake,
 			CatalogPath: "/d/c.duckdb", StoragePath: "/d/data"}, "ducklake:"},
@@ -175,7 +175,7 @@ func TestInitClientsWiresResolvers(t *testing.T) {
 	// The lake's prologue can only name the catalog connection if the resolver
 	// reached it, and the secret only if the secret resolver did.
 	prefix := clients[1].attachPrefix()
-	for _, want := range []string{"quack://catalog:9494", "TOKEN 'tok'", "KEY_ID 'AKIA'"} {
+	for _, want := range []string{"quack:catalog:9494", "TOKEN 'tok'", "KEY_ID 'AKIA'"} {
 		if !strings.Contains(prefix, want) {
 			t.Errorf("prologue is missing %q, so a resolver was not wired:\n%s", want, prefix)
 		}

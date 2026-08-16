@@ -247,7 +247,17 @@ type ServerConfig struct {
 }
 
 func (c ServerConfig) Addr() string {
-	return fmt.Sprintf("%s:%d", c.Host, c.Port)
+	return fmt.Sprintf("%s:%d", c.Host, c.effectivePort())
+}
+
+// quackDefaultPort is the port the extension assumes when a URI names none.
+const quackDefaultPort = 9494
+
+func (c ServerConfig) effectivePort() int {
+	if c.Port == 0 {
+		return quackDefaultPort
+	}
+	return c.Port
 }
 
 // LocalIsRemote reports whether a local-type connection points at a URI rather
@@ -267,8 +277,19 @@ func (c ServerConfig) BaseURL() string {
 	return fmt.Sprintf("%s://%s:%d", scheme, c.Host, c.Port)
 }
 
+// QuackURI renders the connection in the extension's canonical form,
+// `quack:<host>:<port>`, with an IPv6 host bracketed.
+//
+// Canonical rather than `quack://…` because the same string has to serve as a
+// secret SCOPE, and the extension looks secrets up by the URI it was given.
+// Matching the form it canonicalises to keeps the lookup exact rather than
+// relying on prefix matching between two spellings of the same address.
 func (c ServerConfig) QuackURI() string {
-	return fmt.Sprintf("quack://%s", c.Addr())
+	host := c.Host
+	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
+		host = "[" + host + "]" // IPv6 literal
+	}
+	return fmt.Sprintf("quack:%s:%d", host, c.effectivePort())
 }
 
 // DisplayURI is the human-readable string shown in the header per server.
@@ -326,7 +347,7 @@ func (c ServerConfig) AttachPrefix(resolve ConfigResolver, resolveSecret SecretR
 				"ATTACH '%s' AS _local (READ_ONLY); USE _local; ", SQLQuote(c.Path)))
 		}
 	case ConnQuack:
-		b.WriteString(quackAttachStatement(c, "_remote") + "USE _remote; ")
+		b.WriteString(quackPrologue(c, "_remote") + "USE _remote; ")
 	case ConnDuckLake:
 		if c.CatalogRef != "" && resolve != nil {
 			if catCfg, ok := resolve(c.CatalogRef); ok {
@@ -355,32 +376,54 @@ func (c ServerConfig) AttachPrefix(resolve ConfigResolver, resolveSecret SecretR
 // on a private network — was being reached over https:// and failing, with the
 // connection's own TLS setting only ever used to pick a badge colour. Passing
 // the flag either way makes that setting mean what it says.
-// quackAttachStatement renders ATTACH for a Quack URI under the given alias.
+// quackPrologue renders everything needed to reach a Quack server under an
+// alias: load the extension, register the token as a secret, then ATTACH.
 //
-// The option list can legitimately be empty — no token (the extension resolves a
-// quack secret instead) and an SSL setting that matches the extension's own
-// default. An empty list must not become `ATTACH '…' AS x ()`, which does not
-// parse.
-func quackAttachStatement(c ServerConfig, alias string) string {
+// The token goes in a secret rather than an ATTACH option, and this is the
+// second correction to this statement that only running against a real server
+// could produce. TOKEN and DISABLE_SSL are both valid ATTACH options in
+// duckdb-quack main, and *neither* is recognised by the extension build
+// published for DuckDB v1.5.5:
+//
+//	Binder Error: Unrecognized option for attach "disable_ssl"
+//	Binder Error: Unrecognized option for attach "token"
+//
+// A `quack` secret scoped to the URI is the older and stable path — it is what
+// the extension's own secret.test uses, and QuackClient looks it up with
+// LookupSecret(uri, "quack") — so it works on both.
+//
+// The alias is part of the secret name so two Quack connections in one prologue
+// (a DuckLake catalog-by-reference plus its lake) cannot clobber each other.
+func quackPrologue(c ServerConfig, alias string) string {
+	var b strings.Builder
+	b.WriteString("INSTALL quack; LOAD quack; ")
+
+	if c.Token != "" {
+		b.WriteString(fmt.Sprintf(
+			"CREATE OR REPLACE SECRET _quack%s (TYPE quack, TOKEN '%s', SCOPE '%s'); ",
+			alias, SQLQuote(c.Token), SQLQuote(c.QuackURI())))
+	}
+
+	// DISABLE_SSL is still the only way to ask for plaintext to a non-local
+	// host, and it is only emitted when it differs from the extension's own
+	// default. On the v1.5.5 build that combination fails with the Binder Error
+	// above — there is no older spelling for it, so the alternative would be to
+	// silently connect over TLS to a server that is not speaking it.
 	opts := c.quackAttachOptions()
 	if len(opts) == 0 {
-		return fmt.Sprintf("ATTACH '%s' AS %s; ", c.QuackURI(), alias)
+		b.WriteString(fmt.Sprintf("ATTACH '%s' AS %s; ", c.QuackURI(), alias))
+	} else {
+		b.WriteString(fmt.Sprintf("ATTACH '%s' AS %s (%s); ",
+			c.QuackURI(), alias, strings.Join(opts, ", ")))
 	}
-	return fmt.Sprintf("ATTACH '%s' AS %s (%s); ",
-		c.QuackURI(), alias, strings.Join(opts, ", "))
+	return b.String()
 }
 
+// quackAttachOptions returns the ATTACH option list, which now carries only the
+// SSL override — the token is registered as a secret beforehand instead, since
+// TOKEN is not an ATTACH option in the published extension build.
 func (c ServerConfig) quackAttachOptions() []string {
 	var opts []string
-
-	// Omit TOKEN entirely when there is none. The extension falls back to a
-	// `CREATE SECRET (TYPE quack, …)` scoped to the URI when the option is
-	// absent, which is the documented way to keep a token out of the statement;
-	// passing TOKEN '' instead overrides that with an empty credential.
-	if c.Token != "" {
-		opts = append(opts, fmt.Sprintf("TOKEN '%s'", SQLQuote(c.Token)))
-	}
-
 	if opt, ok := disableSSLOption(c, "DISABLE_SSL %t"); ok {
 		opts = append(opts, opt)
 	}
@@ -449,7 +492,7 @@ func (c ServerConfig) quackQueryOptions() []string {
 func buildCatalogAttach(catCfg ServerConfig) string {
 	switch catCfg.Type {
 	case ConnQuack:
-		return quackAttachStatement(catCfg, "_catalog")
+		return quackPrologue(catCfg, "_catalog")
 	case ConnLocal:
 		return fmt.Sprintf("ATTACH '%s' AS _catalog; ", SQLQuote(catCfg.Path))
 	default:
