@@ -10,6 +10,7 @@ import (
 	"github.com/charmbracelet/bubbles/table"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/CathalByrneGit/pintail/internal/quack"
 	"github.com/CathalByrneGit/pintail/internal/version"
@@ -504,15 +505,24 @@ type Model struct {
 	addForm *addServerForm
 }
 
+// NewModel builds the root model from what is on disk.
 func NewModel() Model {
-	configs := quack.LoadServerConfigs()
-	secrets := quack.LoadStorageSecrets()
-	clients := quack.InitClients(configs, secrets)
+	m := NewModelWithConfigs(quack.LoadServerConfigs(), quack.LoadStorageSecrets())
+	m.tokenMgr = NewTokenManager() // reads the token store
+	m.authEditor = NewAuthEditor(m.tokenMgr.tokens, m.clients)
+	return m
+}
 
-	servers := make([]quack.ServerInfo, len(configs))
-	for i, cfg := range configs {
-		servers[i] = cfg.ToServerInfo()
-	}
+// NewModelWithConfigs builds the root model from the connections and secrets
+// given, touching no files.
+//
+// The seam exists so the model can be constructed in a test. NewModel read the
+// config, the secrets and the token store directly, which meant every test that
+// wanted a Model had to assemble one field by field — and the assembled ones
+// drifted from the real thing, so the screens were only ever rendered from
+// hand-built state.
+func NewModelWithConfigs(configs []quack.ServerConfig, secrets []quack.StorageSecret) Model {
+	clients := quack.InitClients(configs, secrets)
 
 	m := Model{
 		clients:        clients,
@@ -522,15 +532,25 @@ func NewModel() Model {
 		data:           make([]connData, len(configs)),
 		focus:          panelConnections,
 		currentView:    viewDashboard,
-		tokenMgr:       NewTokenManager(),
-		scratchpad:     NewScratchpad(servers, clients),
+		tokenMgr:       TokenManager{secrets: secrets},
+		scratchpad:     NewScratchpad(serverInfos(configs), clients),
 		tlsGen:         NewTLSGenerator(configs),
-		authEditor:     NewAuthEditor(quack.LoadTokens(), clients),
+		authEditor:     NewAuthEditor(nil, clients),
 		snapshots:      NewSnapshotsView(clients),
 		logs:           NewLogsView(clients),
 	}
 	m.connTable = buildConnectionTable(nil)
 	return m
+}
+
+// serverInfos projects the connection list into the display form the scratchpad
+// target selector uses.
+func serverInfos(configs []quack.ServerConfig) []quack.ServerInfo {
+	out := make([]quack.ServerInfo, len(configs))
+	for i, cfg := range configs {
+		out[i] = cfg.ToServerInfo()
+	}
+	return out
 }
 
 func buildConnectionTable(conns []quack.Connection) table.Model {
@@ -885,6 +905,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 //	-1 = type selector at top of form  — ←→ / space cycles
 //	 0..N-1 = visible form field index — typed input
 func (m Model) updateAddServer(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// The screen is only ever opened alongside a form, but nil-dereferencing on a
+	// keypress is a crash waiting for the next refactor to reach it.
+	if m.addForm == nil {
+		m.currentView = viewDashboard
+		return m, nil
+	}
 	f := m.addForm
 	visible := f.visibleFields()
 
@@ -1140,6 +1166,34 @@ func (m Model) View() string {
 	if m.width == 0 {
 		return "Initializing Pintail…"
 	}
+	return clampLines(m.view(), m.width)
+}
+
+// clampLines cuts every line to w terminal cells.
+//
+// A line wider than the terminal wraps, which pushes everything after it down
+// the screen and corrupts the layout — one overlong panel makes the whole frame
+// look broken. Individual views truncate their own content, but they compose
+// through lipgloss.JoinVertical/JoinHorizontal, which pad to the widest line, so
+// this is the one place the invariant can be stated for all of them.
+//
+// It is a backstop, not a substitute for a view sizing its content: cutting here
+// loses whatever was past the edge. A test sweeps every screen at every width to
+// keep views from relying on it.
+func clampLines(s string, w int) string {
+	if w <= 0 {
+		return s
+	}
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		if ansi.StringWidth(line) > w {
+			lines[i] = ansi.Truncate(line, w, "")
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) view() string {
 	switch m.currentView {
 	case viewTokens:
 		return m.viewTokenManager()
@@ -1270,8 +1324,13 @@ func (m Model) viewHeader() string {
 			mutedStyle.Render(fmt.Sprintf(" / %d listed", len(d.sessions)))
 	}
 
-	serverRow := "  " + strings.Join(chips, mutedStyle.Render("   ·   ")) + connSummary
-	divider := mutedStyle.Render(strings.Repeat("─", m.width))
+	// Truncate: the chips carry connection names, URIs and offline error
+	// messages, none of which are bounded. Three connections with real hostnames
+	// were enough to push this row past 290 cells, and because JoinVertical pads
+	// every line out to the widest one, an overlong row here dragged the whole
+	// screen past the terminal width.
+	serverRow := truncate("  "+strings.Join(chips, mutedStyle.Render("   ·   "))+connSummary, m.width)
+	divider := mutedStyle.Render(hrule(m.width))
 	return lipgloss.JoinVertical(lipgloss.Left, titleBar, serverRow, divider)
 }
 
@@ -1396,7 +1455,7 @@ func (m Model) viewDashboardFooter() string {
 	}
 
 	lines := []string{
-		mutedStyle.Render(strings.Repeat("─", m.width)),
+		mutedStyle.Render(hrule(m.width)),
 		footerStyle.Render(keys) + hint,
 	}
 
@@ -1420,8 +1479,15 @@ func (m Model) viewAddServerScreen() string {
 			labelStyle.Render("Add Connection") +
 			mutedStyle.Render("  "+version.Label()),
 	)
-	divider := mutedStyle.Render(strings.Repeat("─", m.width))
+	divider := mutedStyle.Render(hrule(m.width))
 
+	// The screen is only ever opened alongside a form, but a view that nil-derefs
+	// is a crash waiting for the next refactor to reach it. Render the empty
+	// state instead of taking the app down.
+	if m.addForm == nil {
+		return lipgloss.JoinVertical(lipgloss.Left, titleBar, divider,
+			"", "  "+mutedStyle.Render("no connection form open — press [esc] to go back"))
+	}
 	f := m.addForm
 	visible := f.visibleFields()
 
@@ -1539,7 +1605,7 @@ func (m Model) viewAddServerScreen() string {
 	)
 
 	body := lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, rightPanel)
-	footerDiv := mutedStyle.Render(strings.Repeat("─", m.width))
+	footerDiv := mutedStyle.Render(hrule(m.width))
 	footerLine := footerStyle.Render(
 		keyBadge("enter") + " save   " + keyBadge("←") + " connection list   " + keyBadge("esc") + " back",
 	)
@@ -1560,14 +1626,14 @@ func (m Model) viewSnapshotsScreen() string {
 		titleStyle.Render("🦆 Pintail") + mutedStyle.Render("  ─  ") +
 			labelStyle.Render("DuckLake Snapshots") + mutedStyle.Render("  "+version.Label()),
 	)
-	divider := mutedStyle.Render(strings.Repeat("─", m.width))
+	divider := mutedStyle.Render(hrule(m.width))
 	header := lipgloss.JoinVertical(lipgloss.Left,
 		titleBar,
 		m.snapshots.ViewTargetBar(),
 		divider,
 	)
 
-	footerDiv := mutedStyle.Render(strings.Repeat("─", m.width))
+	footerDiv := mutedStyle.Render(hrule(m.width))
 	footer := lipgloss.JoinVertical(lipgloss.Left, footerDiv, m.snapshots.ViewFooter())
 
 	headerH := lipgloss.Height(header)
@@ -1594,10 +1660,10 @@ func (m Model) viewLogsScreen() string {
 		titleStyle.Render("🦆 Pintail") + mutedStyle.Render("  ─  ") +
 			labelStyle.Render("Quack Message Log") + mutedStyle.Render("  "+version.Label()),
 	)
-	divider := mutedStyle.Render(strings.Repeat("─", m.width))
+	divider := mutedStyle.Render(hrule(m.width))
 	header := lipgloss.JoinVertical(lipgloss.Left, titleBar, m.logs.ViewTargetBar(), divider)
 
-	footerDiv := mutedStyle.Render(strings.Repeat("─", m.width))
+	footerDiv := mutedStyle.Render(hrule(m.width))
 	footer := lipgloss.JoinVertical(lipgloss.Left, footerDiv, m.logs.ViewFooter())
 
 	panelH := m.height - lipgloss.Height(header) - lipgloss.Height(footer)
@@ -1622,10 +1688,10 @@ func (m Model) viewAuthScreen() string {
 		titleStyle.Render("🦆 Pintail") + mutedStyle.Render("  ─  ") +
 			labelStyle.Render("Auth Policy Editor") + mutedStyle.Render("  "+version.Label()),
 	)
-	divider := mutedStyle.Render(strings.Repeat("─", m.width))
+	divider := mutedStyle.Render(hrule(m.width))
 	header := lipgloss.JoinVertical(lipgloss.Left, titleBar, divider)
 
-	footerDiv := mutedStyle.Render(strings.Repeat("─", m.width))
+	footerDiv := mutedStyle.Render(hrule(m.width))
 	footer := lipgloss.JoinVertical(lipgloss.Left, footerDiv, m.authEditor.ViewFooter())
 
 	headerH := lipgloss.Height(header)
@@ -1660,10 +1726,10 @@ func (m Model) viewTLSScreen() string {
 		titleStyle.Render("🦆 Pintail") + mutedStyle.Render("  ─  ") +
 			labelStyle.Render("TLS Config Generator") + mutedStyle.Render("  "+version.Label()),
 	)
-	divider := mutedStyle.Render(strings.Repeat("─", m.width))
+	divider := mutedStyle.Render(hrule(m.width))
 	header := lipgloss.JoinVertical(lipgloss.Left, titleBar, divider)
 
-	footerDiv := mutedStyle.Render(strings.Repeat("─", m.width))
+	footerDiv := mutedStyle.Render(hrule(m.width))
 	statusBar := "  " + m.tlsGen.ViewStatusBar()
 	footer := lipgloss.JoinVertical(lipgloss.Left, footerDiv, statusBar, m.tlsGen.ViewFooter())
 
@@ -1783,12 +1849,12 @@ func (m Model) viewTokenHeader() string {
 		mutedStyle.Render("tokens  ") +
 		greenStyle.Render(fmt.Sprintf("%d active", activeTokens)) +
 		mutedStyle.Render(fmt.Sprintf(" / %d total", len(m.tokenMgr.tokens)))
-	divider := mutedStyle.Render(strings.Repeat("─", m.width))
+	divider := mutedStyle.Render(hrule(m.width))
 	return lipgloss.JoinVertical(lipgloss.Left, titleBar, statRow, divider)
 }
 
 func (m Model) viewTokenFooter() string {
-	divider := mutedStyle.Render(strings.Repeat("─", m.width))
+	divider := mutedStyle.Render(hrule(m.width))
 	return lipgloss.JoinVertical(lipgloss.Left, divider, m.tokenMgr.ViewFooter())
 }
 
@@ -1799,10 +1865,10 @@ func (m Model) viewScratchpadScreen() string {
 		titleStyle.Render("🦆 Pintail") + mutedStyle.Render("  ─  ") +
 			labelStyle.Render("SQL Scratchpad") + mutedStyle.Render("  "+version.Label()),
 	)
-	divider := mutedStyle.Render(strings.Repeat("─", m.width))
+	divider := mutedStyle.Render(hrule(m.width))
 	header := lipgloss.JoinVertical(lipgloss.Left, titleBar, divider)
 
-	footerDivider := mutedStyle.Render(strings.Repeat("─", m.width))
+	footerDivider := mutedStyle.Render(hrule(m.width))
 	footer := lipgloss.JoinVertical(lipgloss.Left, footerDivider, m.scratchpad.ViewFooter())
 
 	return lipgloss.JoinVertical(lipgloss.Left,

@@ -488,8 +488,25 @@ Tests that talk to a real database skip themselves unless `duckdb` is on
 `$PATH` — they are the ones that catch generated SQL referencing columns or
 functions that don't exist, so it's worth having the CLI installed when
 running them locally. CI (`.github/workflows/ci.yml`) installs a pinned DuckDB,
-runs `gofmt`/`vet`/`build`/`test -race` against the Go floor and current
-stable, and fails if the integration tests silently skipped.
+runs `gofmt`/`vet`/`staticcheck`/`build`/`test -race` against the Go floor and
+current stable, and fails if the integration tests silently skipped.
+
+Three kinds of test carry most of the weight:
+
+- **`internal/quack` against a real `duckdb`.** Generated SQL is only as good
+  as the functions it names, and unit tests cannot tell you that
+  `duckdb_connections()` does not exist. These run the real statements.
+- **Every screen at every width** (`internal/ui/render_test.go`). Both crashes
+  this project has had were in view code at a particular terminal size, so the
+  sweep renders all eight screens at widths from 20 to 300 columns — with data
+  and empty — and asserts that nothing panics and no line exceeds the terminal
+  width. It found an unbounded header row and an unguarded `strings.Repeat`.
+- **The boundary test** (`internal/quack/boundary_test.go`), which fails if the
+  data layer ever imports a terminal library.
+
+New tests are mutation-checked: the bug each one describes is reintroduced to
+confirm the test actually fails. Several assertions in this repo were written,
+looked reasonable, and caught nothing until that step.
 
 ## Configuration
 

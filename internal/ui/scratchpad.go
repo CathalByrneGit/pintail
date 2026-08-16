@@ -605,7 +605,7 @@ func renderResultTable(r quack.QueryResult, maxWidth int) string {
 
 	// Separator
 	for i, w := range widths {
-		sb.WriteString(mutedStyle.Render(strings.Repeat("─", w)))
+		sb.WriteString(mutedStyle.Render(hrule(w)))
 		if i < len(widths)-1 {
 			sb.WriteString(mutedStyle.Render("──┼──"))
 		}
