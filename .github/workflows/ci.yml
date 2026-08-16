@@ -9,6 +9,12 @@ on:
 permissions:
   contents: read
 
+# A push to a branch with an open PR fires both triggers, so the same commit was
+# being built twice. Group by workflow + ref and cancel superseded runs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   # Pinned so a DuckDB release cannot change what CI means overnight. Bump
   # deliberately — the integration tests assert against real SQL behaviour, so
@@ -17,16 +23,23 @@ env:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         # The floor from go.mod, plus whatever is current.
-        go: ["1.22", "stable"]
+        go: ["1.24.2", "stable"]
+        os: [ubuntu-latest]
+        include:
+          # Pintail is a terminal app, and macOS is where a good share of
+          # terminal work happens — it is also where terminfo and the default
+          # shell differ most from Linux. One job rather than a full matrix.
+          - go: stable
+            os: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: ${{ matrix.go }}
           cache: true
@@ -35,12 +48,18 @@ jobs:
         # Without this the integration tests skip, which is exactly the
         # coverage worth having: they are what caught the catalog and session
         # queries referencing SQL that does not exist.
+        shell: bash
         run: |
           # mkdir -p first: unzip -d creates only the final component, so an
           # absent ~/.local made the whole job fail here before a single test ran.
           mkdir -p "$HOME/.local/bin"
+          case "${{ runner.os }}" in
+            Linux)  asset=duckdb_cli-linux-amd64.zip ;;
+            macOS)  asset=duckdb_cli-osx-universal.zip ;;
+            *)      echo "unsupported runner ${{ runner.os }}"; exit 1 ;;
+          esac
           curl -fsSL -o duckdb.zip \
-            "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/duckdb_cli-linux-amd64.zip"
+            "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/${asset}"
           unzip -oq duckdb.zip -d "$HOME/.local/bin"
           chmod +x "$HOME/.local/bin/duckdb"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
@@ -49,6 +68,7 @@ jobs:
         run: duckdb --version
 
       - name: gofmt
+        shell: bash
         run: |
           unformatted="$(gofmt -l .)"
           if [ -n "$unformatted" ]; then
@@ -60,6 +80,13 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+      - name: staticcheck
+        # vet catches a narrow set of mistakes. staticcheck covers the rest:
+        # unused results, impossible conditions, misuse of the standard library.
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@2025.1.1
+          "$(go env GOPATH)/bin/staticcheck" ./...
+
       - name: Build
         run: go build ./...
 
@@ -69,9 +96,151 @@ jobs:
       - name: Confirm the integration tests actually ran
         # A silent skip would hide the loss of the only coverage that talks to
         # real DuckDB, so treat "everything skipped" as a failure.
+        shell: bash
         run: |
+          set -o pipefail
           go test -run 'RealDuckDB' -v ./... | tee out.txt
           if ! grep -q -- '--- PASS: TestMetadataQueriesAgainstRealDuckDB' out.txt; then
             echo "The DuckDB integration test did not run."
             exit 1
           fi
+
+  cross-compile:
+    # A single static binary is the distribution story, so the other two
+    # platforms have to at least build. Cheap insurance against a
+    # Linux-only syscall or build tag creeping in.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache: true
+      - name: Build for every target
+        run: |
+          for target in darwin/amd64 darwin/arm64 windows/amd64 linux/arm64; do
+            GOOS="${target%/*}" GOARCH="${target#*/}" go build -o /dev/null . \
+              && echo "ok   $target" \
+              || { echo "FAIL $target"; exit 1; }
+          done
+
+  live-quack:
+    # Everything above verifies Pintail against DuckDB. This verifies it against
+    # a real Quack server, which is a different claim: the ATTACH option list,
+    # quack_query reaching the server rather than describing us, the columns of
+    # duckdb_logs_parsed('Quack'), and the authorization hook are all things only
+    # a running server can confirm. Until this job existed, that whole half of
+    # the product was checked against the extension's source and nothing else.
+    runs-on: ubuntu-latest
+    env:
+      PINTAIL_TEST_QUACK_HOST: 127.0.0.1
+      PINTAIL_TEST_QUACK_PORT: "9494"
+      # Not a secret: a loopback-only server that exists for the length of one
+      # CI job. quack_serve generates a token when none is given, and passing a
+      # known one saves parsing it back out of the server's stdout.
+      PINTAIL_TEST_QUACK_TOKEN: ci-token-not-a-secret
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache: true
+
+      - name: Install the duckdb CLI
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL -o duckdb.zip \
+            "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/duckdb_cli-linux-amd64.zip"
+          unzip -oq duckdb.zip -d "$HOME/.local/bin"
+          chmod +x "$HOME/.local/bin/duckdb"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Check the quack extension is available
+        # Fail loudly here rather than letting the tests skip. quack is a
+        # pre-release extension; if it stops being installable for the pinned
+        # DuckDB, that is news, not a reason to quietly test nothing.
+        run: |
+          duckdb -no-init -c "INSTALL quack; LOAD quack; SELECT 'quack loaded' AS ok;"
+          duckdb -no-init -c "INSTALL httpfs; LOAD httpfs; SELECT 'httpfs loaded' AS ok;"
+
+      - name: Start a Quack server
+        run: |
+          mkdir -p /tmp/quack
+          # Seed the database the tests assert against.
+          duckdb -no-init /tmp/quack/server.duckdb -c "
+            CREATE TABLE ci_events AS
+              SELECT range::INTEGER AS id,
+                     (random() * 1000)::INTEGER AS user_id
+              FROM range(1000);
+            CREATE VIEW ci_recent AS SELECT * FROM ci_events LIMIT 10;
+          "
+
+          # quack_serve runs the listener on a background thread inside this
+          # duckdb process, so the process has to stay alive. -cmd runs the
+          # statements and then reads stdin; a pipe that never closes and never
+          # delivers anything keeps it blocked there for the life of the job.
+          sleep 3600 | duckdb -no-init /tmp/quack/server.duckdb \
+            -cmd "INSTALL quack; LOAD quack; INSTALL httpfs; LOAD httpfs;
+                  CALL quack_serve('quack:${PINTAIL_TEST_QUACK_HOST}:${PINTAIL_TEST_QUACK_PORT}',
+                                   token='${PINTAIL_TEST_QUACK_TOKEN}');" \
+            > /tmp/quack/server.log 2>&1 &
+          echo "$!" > /tmp/quack/server.pid
+
+      - name: Wait for the server to answer
+        run: |
+          for i in $(seq 1 40); do
+            if curl -fsS "http://${PINTAIL_TEST_QUACK_HOST}:${PINTAIL_TEST_QUACK_PORT}/" >/dev/null 2>&1; then
+              echo "server answered after ${i} attempt(s)"
+              curl -sS "http://${PINTAIL_TEST_QUACK_HOST}:${PINTAIL_TEST_QUACK_PORT}/"
+              exit 0
+            fi
+            sleep 0.5
+          done
+          echo "the Quack server never answered; its output was:"
+          cat /tmp/quack/server.log || true
+          exit 1
+
+      - name: Test against the live server
+        # pipefail, or `go test | tee` reports tee's exit status and a failing
+        # test passes the step. The first run of this job did exactly that: six
+        # of seven live tests failed and only the confirm step below noticed.
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -race -run 'TestLive' -v ./internal/quack/ | tee live.txt
+
+      - name: Confirm the live tests actually ran
+        # These skip themselves when the environment is not set, so a
+        # misconfigured job would otherwise report success having tested nothing.
+        run: |
+          for name in \
+            TestLivePingIdentifiesTheServer \
+            TestLiveQueryThroughAttach \
+            TestLiveCatalog \
+            TestLiveSessions \
+            TestLiveLogging \
+            TestLiveAuthorizationHook \
+            TestLiveWrongTokenIsRejected
+          do
+            if ! grep -q -- "--- PASS: ${name}" live.txt; then
+              echo "${name} did not run against the live server."
+              exit 1
+            fi
+          done
+          echo "all live-server tests ran"
+
+      # The server's own Quack log, trimmed. Untrimmed and unconditional it was
+      # tens of lines of DEBUG at the end of every job, which buried the test
+      # output that explains the failure.
+      - name: Server log (tail)
+        if: failure()
+        run: tail -25 /tmp/quack/server.log || true
+
+      # Printed last so the end of the job log is the reason it failed, rather
+      # than whatever the server happened to log afterwards.
+      - name: Which live tests failed
+        if: failure()
+        run: |
+          echo "--- live test results ---"
+          grep -E '^(=== RUN|--- (PASS|FAIL|SKIP)|    live_test)' live.txt || cat live.txt

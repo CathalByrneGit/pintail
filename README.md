@@ -45,7 +45,7 @@ binary; shells out to the `duckdb` CLI for live operations.
 ```
 🦆 Pintail  ─  DuckDB Quack Protocol Manager  v0.1.0
 ─────────────────────────────────────────────────────────────────────────
-▸ 1:● central-catalog [quack]   quack://catalog:9494             12ms
+▸ 1:● central-catalog [quack]   quack:catalog:9494               12ms
   2:● lake-prod [ducklake]      ducklake:→central-catalog  →  s3:…  18ms
   3:● local-dev [local]         file:/data/analytics.duckdb          1ms
 
@@ -72,7 +72,7 @@ exploration work, reach for Harlequin or DuckDB's local UI.
 ## Getting started — a real setup
 
 Pintail ships with **no mock data**. The default config has one stub
-connection (`localhost` → `quack://localhost:9494`) that won't connect to
+connection (`localhost` → `quack:localhost:9494`) that won't connect to
 anything until you stand up a real backend behind it. The dashboard's
 "active connections" panel and DuckLake catalog panel will be empty until
 that happens — which is honest, not broken.
@@ -188,12 +188,26 @@ fetches for minutes.
 The **Auth policy** screen (`p`) generates Quack's authorization hook — a
 `(connection_id, query) → BOOLEAN` macro plus
 `SET GLOBAL quack_authorization_function` — from the permission toggles, and
-applies it on the server via `quack_query`. Two limits the screen states rather
-than hides: the hook is **per server, not per token** (scoping to one token
-needs an authentication hook recording `connection_id` → user), and prefix
-matching over statement text is not airtight — `WITH x AS (…) INSERT …` begins
-with `WITH` yet still writes. For real read-only enforcement, attach read-only
-or inspect the parsed statement type. See the
+applies it on the server via `quack_query`. Three limits the screen states
+rather than hides:
+
+- The hook is **per server, not per token**. Scoping to one token needs an
+  authentication hook recording `connection_id` → user, looked up via the
+  callback's `sid` argument.
+- Prefix matching over statement text **is not a security boundary**.
+  `WITH x AS (…) INSERT …` begins with `WITH` yet still writes. For enforcement
+  that holds, attach the database read-only.
+- Applying a policy that denies `CREATE` is **effectively one-way**. Quack hands
+  the callback the whole query string, and Pintail's own management script
+  begins with `CREATE OR REPLACE MACRO`, so the policy in force rejects the next
+  apply. `R` runs the `RESET GLOBAL` that still gets through; the only other way
+  back is local access to the server process. Applying such a policy asks for
+  confirmation first.
+
+Pintail also reads `quack_authorization_function` before writing it, and
+**refuses to overwrite a hook it did not install** — another tool's access
+control is not ours to replace. Note that Quack's default is a named allow-all
+callback (`quack_nop_authorization`), not an empty setting. See the
 [Quack security docs](https://duckdb.org/docs/current/quack/security).
 
 ### Bootstrapping the config file directly
@@ -220,7 +234,7 @@ query routing, and metadata fetch accordingly.
 
 | Type       | Use it for                          | Reachability                     | Query routing                                                                                                          |
 |------------|-------------------------------------|----------------------------------|------------------------------------------------------------------------------------------------------------------------|
-| `quack`    | Remote DuckDB via Quack             | `GET /` banner check             | `ATTACH 'quack://…' AS _remote (TOKEN '…', DISABLE_SSL …); USE _remote;`                                                |
+| `quack`    | Remote DuckDB via Quack             | `GET /` banner check             | `CREATE OR REPLACE SECRET … (TYPE quack, TOKEN '…', SCOPE 'quack:host:port'); ATTACH 'quack:host:port' AS _remote; USE _remote;` |
 | `local`    | Plain `.duckdb` file on disk        | `os.Stat(path)`                  | `duckdb <path> -json -c "<sql>"` (file opened directly via argv; a `storage_secret_ref` is prepended as `CREATE SECRET`) |
 | `ducklake` | DuckLake lakehouse                  | TCP dial of catalog host / stat  | `INSTALL ducklake; LOAD ducklake; ATTACH 'ducklake:…' AS _lake (DATA_PATH '…'); USE _lake;`                            |
 
@@ -240,7 +254,8 @@ Pintail emits the two-step attach automatically:
 
 ```sql
 INSTALL ducklake; LOAD ducklake;
-ATTACH 'quack://catalog.internal:9494' AS _catalog (TOKEN 'qk_…');
+CREATE OR REPLACE SECRET _quack_catalog (TYPE quack, TOKEN 'qk_…', SCOPE 'quack:catalog.internal:9494');
+ATTACH 'quack:catalog.internal:9494' AS _catalog;
 ATTACH 'ducklake:_catalog' AS _lake (DATA_PATH 's3://datalake-prod/lake');
 USE _lake;
 ```
@@ -297,7 +312,8 @@ Pintail injects the `CREATE SECRET` ahead of the ATTACH automatically:
 INSTALL httpfs; LOAD httpfs;
 CREATE OR REPLACE SECRET _storage (TYPE s3, KEY_ID '…', SECRET '…', REGION 'us-east-1', SCOPE 's3://datalake-prod/lake');
 INSTALL ducklake; LOAD ducklake;
-ATTACH 'quack://catalog.internal:9494' AS _catalog (TOKEN 'qk_…');
+CREATE OR REPLACE SECRET _quack_catalog (TYPE quack, TOKEN 'qk_…', SCOPE 'quack:catalog.internal:9494');
+ATTACH 'quack:catalog.internal:9494' AS _catalog;
 ATTACH 'ducklake:_catalog' AS _lake (DATA_PATH 's3://datalake-prod/lake');
 USE _lake;
 -- your query
@@ -427,23 +443,58 @@ verified against:
 | Component | Version | How |
 |-----------|---------|-----|
 | DuckDB CLI | `v1.5.5` (Variegata) | Queries run against a real binary — the integration tests do this in CI |
-| `duckdb-quack` | `main` @ `7e80f7f` (2026-07-20) | Extension sources read for the wire protocol, ATTACH options, SSL defaults, and `quack_active_connections()` |
-| `ducklake` | `main` @ `3d8e24a` (2026-08-13) | Sources read for `snapshots()`, `AT (VERSION => …)` and `ducklake_expire_snapshots` |
+| `quack` extension | installed for the pinned DuckDB | **CI starts a real server** with `quack_serve` and runs Pintail's own client against it |
+| `duckdb-quack` | `main` @ `7e80f7f` (2026-07-20) | Extension sources and its own test suite read for the wire protocol, ATTACH options, SSL defaults, and `quack_active_connections()`. **Note the skew:** Pintail runs against whatever build is published for the pinned DuckDB, which is older than `main` — see below |
+| `ducklake` | `main` @ `3d8e24a` (2026-08-13) | Sources read for `snapshots()`, `AT (VERSION => …)` and `ducklake_expire_snapshots`; the snapshot listing is executed against a real lake in CI |
 | Quack docs | `docs/current/quack/*` | Overview, reference, security, and the reverse-proxy guide |
 
 What that means concretely:
 
+- **Executed against a live Quack server** (the `live-quack` CI job): the
+  `CREATE SECRET (TYPE quack, …)` + `ATTACH` form, query execution and error
+  reporting through it, the catalog listing, `quack_active_connections()` via
+  `quack_query`, `enable_logging` plus the columns of
+  `duckdb_logs_parsed('Quack')`, the authorization hook's read-back / install /
+  `RESET GLOBAL` cycle, and rejection of a wrong token. CI fails if any of
+  these silently skip, so "passing" cannot mean "tested nothing".
 - **Executed against DuckDB 1.5.5**: the catalog query (`duckdb_tables()` /
-  `duckdb_views()`), the session-facts query, `enable_logging` /
-  `duckdb_logs_parsed`, and the scratchpad's own error and cancellation paths.
-  These are covered by tests that skip when `duckdb` is absent.
-- **Read from sources or docs, not executed**: everything that needs a running
-  Quack server or the `ducklake` extension — the `ATTACH … (TOKEN …,
-  DISABLE_SSL …)` form, `quack_query`, `quack_active_connections()`, the
-  authorization hook, and the DuckLake snapshot SQL. The extension host is
-  unreachable from the environment this was developed in, so these match the
-  published sources and docs but have not been round-tripped against a live
-  server.
+  `duckdb_views()`), the session-facts query, DuckLake snapshot listing and
+  time-travel SQL, Parquet export, and the scratchpad's own error and
+  cancellation paths.
+- **Read from sources or docs, not executed**: the reverse-proxy configs (they
+  describe Caddy/Nginx/Envoy, not DuckDB), and the per-token scoping caveats
+  around the authorization hook, which is per-server by design.
+
+The authorization screen's toggles compile to a statement-prefix regexp, which
+is **not** a security boundary — `WITH x AS (…) INSERT …` passes as a read. The
+screen says so, and DuckLake or a read-only ATTACH is the real mechanism.
+
+**On reading sources versus running them.** Those are not the same check, and
+the difference bit this project twice in the same statement. Both `TOKEN` and
+`DISABLE_SSL` are valid `ATTACH` options in duckdb-quack `main` — they went in
+with the commit pinned above — and *neither* exists in the build published for
+DuckDB v1.5.5, which is what `INSTALL quack` actually gives you:
+
+```
+Binder Error: Unrecognized option for attach "disable_ssl"
+Binder Error: Unrecognized option for attach "token"
+```
+
+Every Quack connection Pintail made failed. The source said the options
+existed; the extension people install disagreed. So:
+
+- The token goes in a `quack` secret scoped to the URI, which is the older and
+  stable path (the extension's own `secret.test` uses it, and its client
+  resolves it with `LookupSecret(uri, "quack")`).
+- `DISABLE_SSL` is sent only when it differs from the extension's own default —
+  plaintext for `localhost`/`127.0.0.1`/`::1`, SSL otherwise — so the ordinary
+  cases need nothing new. Plaintext to a *non-local* host is the one
+  combination with no older spelling; on the v1.5.5 build it fails with the
+  Binder Error above, which is better than silently attempting TLS against a
+  server that is not speaking it.
+
+The `live-quack` job exists so the next gap of this kind is found by CI rather
+than by you.
 
 If you run Pintail against a newer Quack than the above and something breaks,
 the generated SQL in each screen is visible on screen for exactly that reason:
@@ -451,7 +502,7 @@ copy it, adjust it, and open an issue.
 
 ## Building
 
-Requires Go 1.22+.
+Requires Go 1.24.2+ (the floor the Bubble Tea v1 line sets).
 
 ```bash
 git clone https://github.com/CathalByrneGit/pintail
@@ -488,8 +539,25 @@ Tests that talk to a real database skip themselves unless `duckdb` is on
 `$PATH` — they are the ones that catch generated SQL referencing columns or
 functions that don't exist, so it's worth having the CLI installed when
 running them locally. CI (`.github/workflows/ci.yml`) installs a pinned DuckDB,
-runs `gofmt`/`vet`/`build`/`test -race` against the Go floor and current
-stable, and fails if the integration tests silently skipped.
+runs `gofmt`/`vet`/`staticcheck`/`build`/`test -race` against the Go floor and
+current stable, and fails if the integration tests silently skipped.
+
+Three kinds of test carry most of the weight:
+
+- **`internal/quack` against a real `duckdb`.** Generated SQL is only as good
+  as the functions it names, and unit tests cannot tell you that
+  `duckdb_connections()` does not exist. These run the real statements.
+- **Every screen at every width** (`internal/ui/render_test.go`). Both crashes
+  this project has had were in view code at a particular terminal size, so the
+  sweep renders all eight screens at widths from 20 to 300 columns — with data
+  and empty — and asserts that nothing panics and no line exceeds the terminal
+  width. It found an unbounded header row and an unguarded `strings.Repeat`.
+- **The boundary test** (`internal/quack/boundary_test.go`), which fails if the
+  data layer ever imports a terminal library.
+
+New tests are mutation-checked: the bug each one describes is reintroduced to
+confirm the test actually fails. Several assertions in this repo were written,
+looked reasonable, and caught nothing until that step.
 
 ## Configuration
 
@@ -546,7 +614,7 @@ Other files written under `~/.duckdb/`:
 
 **TLS config:** `↑↓` field · `tab` proxy type · `pgup`/`pgdn` scroll · `ctrl+s` save · `esc` back
 
-**Auth policy:** `↑↓` select · `tab` switch panel · `space` toggle · `a` apply · `T` cycle apply target · `esc` save & back
+**Auth policy:** `↑↓` select · `tab` switch panel · `space` toggle · `a` apply (twice, for a policy that denies `CREATE`) · `R` reset the server's hook to the default · `T` cycle apply target · `esc` save & back
 
 **Connections (`a`):** `↑↓`/`tab` field · `←→`/`space` cycle type · `enter` advance/save · `esc` cancel; on the list panel: `e` edit · `d` delete · `→` back to form
 
@@ -554,29 +622,53 @@ Other files written under `~/.duckdb/`:
 
 ```
 pintail/
-├── main.go        — entry point + CLI subcommands (list/ping/query)
-├── data.go        — domain types, mock fallback data, tick command
-├── styles.go      — Lip Gloss palette and shared styles
-├── client.go      — QuackClient: type-aware ping/query, secrets/catalog resolvers, config I/O
-├── model.go       — root Bubble Tea model, view routing, screen layouts
-├── scratchpad.go  — quick-check SQL editor, async query, CSV/Parquet export
-├── tokens.go      — Quack token manager (mode 1 of the secrets screen)
-├── secrets.go     — Storage secret manager (mode 2 of the secrets screen)
-├── ducklake.go    — snapshots view, time-travel / expire-snapshots SQL
-├── logs.go        — Quack message-log view
-├── tls.go         — Caddy / Nginx / Envoy config generators
-├── auth.go        — permission grid + Quack authorization-hook generator
-├── version.go     — version string, stampable with -ldflags
-└── .github/workflows/ci.yml — fmt / vet / build / test -race, with a real duckdb
+├── main.go                     — entry point: dispatch to the TUI or a subcommand
+├── internal/quack/             — the data layer. Talks to duckdb, generates SQL,
+│   │                             parses results. Imports no terminal library, and
+│   │                             a test enforces that (boundary_test.go).
+│   ├── client.go               — QuackClient: type-aware ping/query, the duckdb
+│   │                             invocation (argv + stdin), config and token I/O
+│   ├── types.go                — Connection, ServerInfo, Catalog*, QueryResult
+│   ├── ducklake.go             — snapshot listing, time-travel / expire SQL
+│   ├── logs.go                 — Quack message log: schema, query, parser
+│   └── tokens.go               — the bearer-credential model
+├── internal/ui/                — the screens. Bubble Tea sub-models.
+│   ├── model.go                — root model, view routing, screen layouts
+│   ├── commands.go             — the tea.Cmd wrappers and result messages that
+│   │                             carry the client's values into the update loop
+│   ├── scratchpad.go           — SQL editor, async query, CSV/Parquet export
+│   ├── tokens.go / secrets.go  — token manager, storage-secret manager
+│   ├── ducklake.go / logs.go   — snapshots view, message-log view
+│   ├── tls.go                  — Caddy / Nginx / Envoy config generators
+│   ├── auth.go                 — permission grid + authorization-hook generator
+│   ├── data.go / styles.go     — tick command, Lip Gloss palette
+├── internal/cli/               — list / ping / query, writing through an injected
+│                                 io.Writer so the output is testable
+├── internal/version/           — version string, stampable with -ldflags
+├── testdata/                   — fixtures shared between packages
+└── .github/workflows/ci.yml    — fmt / vet / staticcheck / build / test -race,
+                                  against a real duckdb and a live Quack server
 ```
 
 ## Architecture notes
 
 - **Elm architecture** — each screen is a sub-model with its own
   `Update`/`View`; the root `Model` routes messages and composes layouts.
+- **The data layer knows nothing about the terminal** — `internal/quack`
+  exposes synchronous, `context`-taking methods that return values and
+  errors. The `tea.Cmd` wrappers and result messages live in
+  `internal/ui/commands.go`. This is enforced by a test rather than left
+  to discipline: before the split everything was `package main` and the
+  client returned Bubble Tea messages directly.
 - **All I/O async** — pings, queries, snapshot fetches, and metadata
   polls run as `tea.Cmd` goroutines and deliver typed messages back to
   the update loop. The UI never blocks.
+- **Credentials never reach argv** — the SQL script, which carries the
+  bearer token and any object-store secret, is fed to `duckdb` on stdin.
+  argv would be readable from `/proc/<pid>/cmdline` by any process on the
+  box. Every invocation also passes `-no-init` (so the operator's
+  `~/.duckdbrc` cannot break Pintail's prologue) and `-bail` (a piped
+  script does not stop at the first error on its own).
 - **Catalog-ref resolution via injected closure** — each `QuackClient`
   holds a `ConfigResolver` (closure over `[]ServerConfig`). DuckLake's
   `AttachPrefix` uses it to look up `CatalogRef` at query time.

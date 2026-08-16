@@ -1,0 +1,2087 @@
+package ui
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/charmbracelet/bubbles/table"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
+
+	"github.com/CathalByrneGit/pintail/internal/quack"
+	"github.com/CathalByrneGit/pintail/internal/version"
+)
+
+// ── view enum ─────────────────────────────────────────────────────────────
+
+type appView int
+
+const (
+	viewDashboard appView = iota
+	viewTokens
+	viewScratchpad
+	viewAddServer
+	viewTLS
+	viewAuth
+	viewSnapshots
+	viewLogs
+)
+
+type panel int
+
+const (
+	panelConnections panel = iota
+	panelCatalog
+)
+
+// ── tickers ───────────────────────────────────────────────────────────────
+//
+// Three independent cadences keep subprocess spawning under control:
+//   • pingTick    (5s)  — cheap TCP reachability check, no subprocess
+//   • sessionTick (15s) — refresh live sessions for ONLINE servers only
+//   • catalog is fetched once on each offline→online transition, not on a timer
+
+type pingTickMsg time.Time
+type sessionTickMsg time.Time
+
+func pingTickCmd() tea.Cmd {
+	return tea.Tick(5*time.Second, func(t time.Time) tea.Msg {
+		return pingTickMsg(t)
+	})
+}
+
+func sessionTickCmd() tea.Cmd {
+	return tea.Tick(15*time.Second, func(t time.Time) tea.Msg {
+		return sessionTickMsg(t)
+	})
+}
+
+// ── add-server form ───────────────────────────────────────────────────────
+//
+// The form has a Type selector at the top (cycled with space / ←→) which
+// decides which input fields appear below. All possible field values are
+// kept on the struct so cycling Type doesn't lose what the user already typed.
+
+type addServerForm struct {
+	connType quack.ConnType
+	focusIdx int // -1 = type selector focused; -2 = connection list focused; ≥0 = field index
+	// editingIdx >= 0 means we're editing m.configs[editingIdx] instead of adding
+	editingIdx int
+
+	// All possible values; only some matter per connType.
+	name        string
+	host        string
+	port        string
+	token       string
+	tls         string // "y"/"n"
+	path        string
+	catalogPath string
+	catalogRef  string
+	storagePath string
+	secretRef   string // storage_secret_ref — applies to local + ducklake
+
+	// Index of currently-selected row in the connection list, for edit/delete.
+	listCursor int
+
+	// Why the last save attempt was refused, shown under the form. Enter used
+	// to do nothing at all when the form wasn't saveable, which looked like a
+	// broken key.
+	errMsg string
+}
+
+type formField struct {
+	label       string
+	value       *string
+	placeholder string
+	hint        string
+}
+
+// ── path-completion helpers ───────────────────────────────────────────────
+//
+// These power the tab-to-complete behaviour on path-style fields in the
+// add-connection form. Shell-style: tab completes to the longest common
+// prefix among matching files; once the value matches an existing path
+// (no further completion possible), tab falls through to the normal
+// "advance to next field" behaviour.
+
+// isPathField reports whether a form-field label represents a filesystem
+// path that should support tab completion. Kept as a small allowlist
+// rather than a struct flag to avoid threading new state through the
+// visibleFields() return type.
+func isPathField(label string) bool {
+	switch label {
+	case "Path", "Catalog path", "Storage":
+		return true
+	}
+	return false
+}
+
+// completePath expands ~ and returns either the same partial path (no
+// matches), the unique match (single match), or the longest common prefix
+// of all matches. The returned value is what should replace the field's
+// current contents.
+func completePath(partial string) string {
+	expanded := partial
+	if strings.HasPrefix(expanded, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			expanded = filepath.Join(home, expanded[2:])
+		}
+	}
+	matches, err := filepath.Glob(expanded + "*")
+	if err != nil || len(matches) == 0 {
+		return partial
+	}
+	if len(matches) == 1 {
+		// Append a trailing slash for directories to make the next tab
+		// drill in. Shell convention.
+		if info, err := os.Stat(matches[0]); err == nil && info.IsDir() {
+			return matches[0] + string(filepath.Separator)
+		}
+		return matches[0]
+	}
+	// Longest common prefix among multiple matches.
+	lcp := matches[0]
+	for _, m := range matches[1:] {
+		lcp = longestCommonPrefix(lcp, m)
+	}
+	return lcp
+}
+
+func longestCommonPrefix(a, b string) string {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	for i := 0; i < n; i++ {
+		if a[i] != b[i] {
+			return a[:i]
+		}
+	}
+	return a[:n]
+}
+
+func newAddServerForm() *addServerForm {
+	return &addServerForm{
+		connType:   quack.ConnQuack,
+		focusIdx:   -1,
+		editingIdx: -1,
+		port:       "9494",
+		tls:        "n",
+	}
+}
+
+// formFromConfig builds a form pre-populated for editing an existing config.
+func formFromConfig(cfg quack.ServerConfig, idx int) *addServerForm {
+	f := &addServerForm{
+		connType:    cfg.Type,
+		focusIdx:    0,
+		editingIdx:  idx,
+		name:        cfg.Name,
+		host:        cfg.Host,
+		port:        fmt.Sprintf("%d", cfg.Port),
+		token:       cfg.Token,
+		path:        cfg.Path,
+		catalogPath: cfg.CatalogPath,
+		catalogRef:  cfg.CatalogRef,
+		storagePath: cfg.StoragePath,
+		secretRef:   cfg.StorageSecretRef,
+	}
+	if cfg.Port == 0 {
+		f.port = "9494"
+	}
+	if cfg.TLS {
+		f.tls = "y"
+	} else {
+		f.tls = "n"
+	}
+	if f.connType == "" {
+		f.connType = quack.ConnQuack
+	}
+	return f
+}
+
+// visibleFields returns the editable fields for the currently-selected type.
+//
+// The per-type field sets stay as type-dispatch — they're different fields
+// with different meanings for each backend. The Storage secret field is the
+// one cross-cutting concern: any type with CapStorageSecrets gets it appended.
+func (f *addServerForm) visibleFields() []formField {
+	var base []formField
+	switch f.connType {
+	case quack.ConnLocal:
+		base = []formField{
+			{"Name", &f.name, "e.g. local-dev", "logical name for this connection"},
+			{"Path", &f.path, "/path/to/database.duckdb", "absolute path; or remote URI like s3://bucket/db.duckdb"},
+		}
+	case quack.ConnDuckLake:
+		base = []formField{
+			{"Name", &f.name, "e.g. lake-prod", "logical name for this connection"},
+			{"Catalog ref", &f.catalogRef, "name of another connection (preferred)", "use a configured connection as catalog — overrides Catalog path"},
+			{"Catalog path", &f.catalogPath, "postgres://… · sqlite:///… · ./catalog.duckdb", "freeform catalog URL or path (used when Catalog ref is empty)"},
+			{"Storage", &f.storagePath, "s3://bucket/lake or /mnt/lake", "object storage root (DATA_PATH)"},
+		}
+	default: // ConnQuack
+		base = []formField{
+			{"Name", &f.name, "e.g. prod-quack", "logical name for this connection"},
+			{"Host", &f.host, "localhost or IP", "Quack server hostname"},
+			{"Port", &f.port, "9494", "Quack server port"},
+			{"Token", &f.token, "shared master token", "leave blank if server has no auth"},
+			{"TLS", &f.tls, "n", "y for HTTPS, n for HTTP"},
+		}
+	}
+
+	// Cross-cutting field: any backend with CapStorageSecrets gets the ref field.
+	probe := quack.ServerConfig{Type: f.connType}
+	if probe.Supports(quack.CapStorageSecrets) {
+		hint := "name of a Storage secret — manage these on the token screen"
+		if f.connType == quack.ConnLocal {
+			hint = "name of a Storage secret — needed when path is a remote URI"
+		}
+		base = append(base, formField{
+			"Storage secret", &f.secretRef,
+			"  (optional)", hint,
+		})
+	}
+	return base
+}
+
+// toConfig builds a ServerConfig from the current form state.
+func (f *addServerForm) toConfig() quack.ServerConfig {
+	port := 9494
+	fmt.Sscanf(f.port, "%d", &port)
+	tls := strings.ToLower(strings.TrimSpace(f.tls)) == "y"
+	return quack.ServerConfig{
+		Name:             strings.TrimSpace(f.name),
+		Type:             f.connType,
+		Host:             strings.TrimSpace(f.host),
+		Port:             port,
+		Token:            f.token,
+		TLS:              tls,
+		Path:             strings.TrimSpace(f.path),
+		CatalogPath:      strings.TrimSpace(f.catalogPath),
+		CatalogRef:       strings.TrimSpace(f.catalogRef),
+		StoragePath:      strings.TrimSpace(f.storagePath),
+		StorageSecretRef: strings.TrimSpace(f.secretRef),
+	}
+}
+
+// valid returns whether the form has the minimum required fields filled in.
+func (f *addServerForm) valid() bool {
+	if strings.TrimSpace(f.name) == "" {
+		return false
+	}
+	switch f.connType {
+	case quack.ConnLocal:
+		return f.path != ""
+	case quack.ConnDuckLake:
+		return f.storagePath != "" && (f.catalogPath != "" || f.catalogRef != "")
+	default:
+		return f.host != ""
+	}
+}
+
+// problem returns the reason this form cannot be saved, or "" when it can.
+//
+// Beyond required fields, this catches the references that used to be accepted
+// and then failed silently at query time: a duplicate name (name lookup finds
+// the first match, so the second connection is unreachable by catalog_ref, the
+// CLI subcommands, and the scratchpad target list), a catalog_ref or
+// storage_secret_ref pointing at something that doesn't exist, and a DuckLake
+// naming itself as its own catalog.
+func (f *addServerForm) problem(configs []quack.ServerConfig, secrets []quack.StorageSecret) string {
+	name := strings.TrimSpace(f.name)
+	if name == "" {
+		return "name is required"
+	}
+
+	switch f.connType {
+	case quack.ConnLocal:
+		if strings.TrimSpace(f.path) == "" {
+			return "path is required for a local connection"
+		}
+	case quack.ConnDuckLake:
+		if strings.TrimSpace(f.storagePath) == "" {
+			return "storage path is required for a DuckLake connection"
+		}
+		if strings.TrimSpace(f.catalogPath) == "" && strings.TrimSpace(f.catalogRef) == "" {
+			return "a DuckLake connection needs either a catalog ref or a catalog path"
+		}
+	default:
+		if strings.TrimSpace(f.host) == "" {
+			return "host is required for a Quack connection"
+		}
+	}
+
+	for i, cfg := range configs {
+		if i == f.editingIdx {
+			continue // editing this one; its own name is not a clash
+		}
+		if strings.EqualFold(cfg.Name, name) {
+			return fmt.Sprintf("a connection named %q already exists", cfg.Name)
+		}
+	}
+
+	if ref := strings.TrimSpace(f.catalogRef); ref != "" && f.connType == quack.ConnDuckLake {
+		if strings.EqualFold(ref, name) {
+			return "a DuckLake cannot be its own catalog"
+		}
+		if !hasConfigNamed(configs, ref) {
+			return fmt.Sprintf("no connection named %q to use as the catalog", ref)
+		}
+	}
+
+	if ref := strings.TrimSpace(f.secretRef); ref != "" {
+		if !hasSecretNamed(secrets, ref) {
+			return fmt.Sprintf("no storage secret named %q — create it on the tokens screen", ref)
+		}
+	}
+
+	return ""
+}
+
+func hasConfigNamed(configs []quack.ServerConfig, name string) bool {
+	for _, cfg := range configs {
+		if cfg.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func hasSecretNamed(secrets []quack.StorageSecret, name string) bool {
+	for _, s := range secrets {
+		if s.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// ── per-connection metadata ───────────────────────────────────────────────
+
+// connData is the last metadata fetched for one connection. Errors are kept
+// alongside the data rather than replacing it: a failed refresh should say so
+// without discarding the last known-good listing.
+type connData struct {
+	sessions      []quack.Connection
+	catalog       []quack.CatalogSchema
+	reportedCount string // connection count as reported by the backend
+	sessionErr    string
+	catalogErr    string
+	sessionsAt    time.Time
+	catalogAt     time.Time
+}
+
+// syncConnData resizes the per-connection metadata to match the connection
+// list and keeps the selection in range — connections can be added and deleted
+// while fetches for the old indices are still in flight.
+func (m *Model) syncConnData() {
+	if len(m.data) > len(m.configs) {
+		m.data = m.data[:len(m.configs)]
+	}
+	for len(m.data) < len(m.configs) {
+		m.data = append(m.data, connData{})
+	}
+	if m.selected >= len(m.configs) {
+		m.selected = len(m.configs) - 1
+	}
+	if m.selected < 0 {
+		m.selected = 0
+	}
+}
+
+// removeConnData drops the metadata for a deleted connection so the remaining
+// entries stay aligned with the connections they describe.
+func (m *Model) removeConnData(idx int) {
+	if idx < 0 || idx >= len(m.data) {
+		return
+	}
+	m.data = append(m.data[:idx], m.data[idx+1:]...)
+}
+
+// selectedData returns the metadata for the connection the dashboard is
+// showing. The second return is false when there is nothing to show.
+func (m Model) selectedData() (connData, bool) {
+	if m.selected < 0 || m.selected >= len(m.data) {
+		return connData{}, false
+	}
+	return m.data[m.selected], true
+}
+
+// selectedSessionQuery is the SQL of the session highlighted in the table, when
+// the backend reported one.
+func (m Model) selectedSessionQuery() string {
+	d, ok := m.selectedData()
+	if !ok {
+		return ""
+	}
+	cursor := m.connTable.Cursor()
+	if cursor < 0 || cursor >= len(d.sessions) {
+		return ""
+	}
+	return d.sessions[cursor].Query
+}
+
+// selectedName is the display name of the selected connection, or "" if none.
+func (m Model) selectedName() string {
+	if m.selected < 0 || m.selected >= len(m.configs) {
+		return ""
+	}
+	return m.configs[m.selected].Name
+}
+
+// selectConnection moves the dashboard to a connection by index, ignoring
+// out-of-range requests (the digit keys are direct-dial, so 9 on a two-server
+// setup should do nothing rather than jump).
+func (m *Model) selectConnection(idx int) {
+	if idx >= 0 && idx < len(m.configs) {
+		m.selected = idx
+		m.connTable.SetRows(connectionRows(m.data[idx].sessions, m.connPanelWidth()))
+		m.connTable.GotoTop()
+	}
+}
+
+// cycleConnection steps the selection by delta, wrapping.
+func (m *Model) cycleConnection(delta int) {
+	if len(m.configs) == 0 {
+		return
+	}
+	next := (m.selected + delta + len(m.configs)) % len(m.configs)
+	m.selectConnection(next)
+}
+
+// ── Model ─────────────────────────────────────────────────────────────────
+
+type Model struct {
+	width  int
+	height int
+
+	currentView appView
+
+	// real server clients (config + live state)
+	clients        []*quack.QuackClient
+	configs        []quack.ServerConfig  // kept in sync with clients
+	storageSecrets []quack.StorageSecret // referenced via Config.StorageSecretRef
+
+	// per-client previous online state, for transition detection
+	wasOnline []bool
+
+	// dashboard
+	focus     panel
+	connTable table.Model
+	tick      int
+
+	// Metadata per connection, index-aligned with clients/configs, and which
+	// one the dashboard panels are showing. This used to be a single global
+	// set of sessions and catalog, so with several servers online the last
+	// responder overwrote everyone else and nothing on screen said whose data
+	// you were looking at.
+	data     []connData
+	selected int
+
+	// token manager
+	tokenMgr TokenManager
+
+	// scratchpad
+	scratchpad Scratchpad
+
+	// auth policy editor
+	authEditor AuthEditor
+
+	// ducklake snapshots
+	snapshots SnapshotsView
+
+	// quack message log
+	logs LogsView
+
+	// tls config generator
+	tlsGen TLSGenerator
+
+	// add-server form
+	addForm *addServerForm
+}
+
+// NewModel builds the root model from what is on disk.
+func NewModel() Model {
+	m := NewModelWithConfigs(quack.LoadServerConfigs(), quack.LoadStorageSecrets())
+	m.tokenMgr = NewTokenManager() // reads the token store
+	m.authEditor = NewAuthEditor(m.tokenMgr.tokens, m.clients)
+	return m
+}
+
+// NewModelWithConfigs builds the root model from the connections and secrets
+// given, touching no files.
+//
+// The seam exists so the model can be constructed in a test. NewModel read the
+// config, the secrets and the token store directly, which meant every test that
+// wanted a Model had to assemble one field by field — and the assembled ones
+// drifted from the real thing, so the screens were only ever rendered from
+// hand-built state.
+func NewModelWithConfigs(configs []quack.ServerConfig, secrets []quack.StorageSecret) Model {
+	clients := quack.InitClients(configs, secrets)
+
+	m := Model{
+		clients:        clients,
+		configs:        configs,
+		storageSecrets: secrets,
+		wasOnline:      make([]bool, len(clients)),
+		data:           make([]connData, len(configs)),
+		focus:          panelConnections,
+		currentView:    viewDashboard,
+		tokenMgr:       TokenManager{secrets: secrets},
+		scratchpad:     NewScratchpad(serverInfos(configs), clients),
+		tlsGen:         NewTLSGenerator(configs),
+		authEditor:     NewAuthEditor(nil, clients),
+		snapshots:      NewSnapshotsView(clients),
+		logs:           NewLogsView(clients),
+	}
+	m.connTable = buildConnectionTable(nil, 0)
+	return m
+}
+
+// serverInfos projects the connection list into the display form the scratchpad
+// target selector uses.
+func serverInfos(configs []quack.ServerConfig) []quack.ServerInfo {
+	out := make([]quack.ServerInfo, len(configs))
+	for i, cfg := range configs {
+		out[i] = cfg.ToServerInfo()
+	}
+	return out
+}
+
+// connColumns are the session table's columns with their preferred widths, and
+// the order in which they are given up when the panel is too narrow for all of
+// them. Least useful first: knowing a session is active matters more than
+// knowing its catalog.
+var connColumns = []struct {
+	title string
+	width int
+	// drop is the order this column is sacrificed in; 0 is never dropped.
+	drop int
+}{
+	{"ID", 4, 0},
+	{"IP Address", 15, 4},
+	{"Identity", 16, 3},
+	{"Catalog", 12, 5},
+	{"Duration", 8, 2},
+	{"Queries", 8, 1},
+	{"Status", 10, 0},
+}
+
+// tableCellPadding is what the bubbles table adds around each cell's content.
+const tableCellPadding = 2
+
+// buildConnectionTable sizes the session table to the width available.
+//
+// The columns used to be fixed, summing to 73 cells before the table's own
+// per-cell padding — about 87 in total, against a panel roughly 64 wide on a
+// 110-column terminal. The header and its rule wrapped inside the panel on any
+// ordinary terminal, which is what a hardcoded layout does the moment the box
+// around it is derived from the real width.
+//
+// width is the space available for the table. Zero or negative means "not laid
+// out yet", which gets the full set at their preferred widths.
+func buildConnectionTable(conns []quack.Connection, width int) table.Model {
+	cols := connectionColumns(width)
+	t := table.New(
+		table.WithColumns(cols),
+		table.WithRows(connectionRows(conns, width)),
+		table.WithFocused(true),
+		table.WithHeight(8),
+	)
+	s := table.DefaultStyles()
+	s.Header = s.Header.
+		BorderStyle(lipgloss.NormalBorder()).
+		BorderForeground(colorPanelBorder).
+		BorderBottom(true).Bold(true).
+		Foreground(colorDuckYellow)
+	s.Selected = s.Selected.
+		Foreground(colorDarkBg).Background(colorDuckYellow).Bold(false)
+	t.SetStyles(s)
+	return t
+}
+
+// connectionColumns picks the widest set of columns that fits, dropping the
+// least useful ones first and then shrinking what remains.
+func columnsKept(width int) []bool {
+	keep := make([]bool, len(connColumns))
+	for i := range keep {
+		keep[i] = true
+	}
+	if width <= 0 {
+		return keep // not laid out yet: keep everything
+	}
+
+	total := func() int {
+		sum := 0
+		for i, c := range connColumns {
+			if keep[i] {
+				sum += c.width + tableCellPadding
+			}
+		}
+		return sum
+	}
+
+	// Drop in the declared order until it fits, never dropping the two columns
+	// that identify a row and its state.
+	for order := 1; total() > width; order++ {
+		dropped := false
+		for i, c := range connColumns {
+			if c.drop == order && keep[i] {
+				keep[i] = false
+				dropped = true
+			}
+		}
+		if !dropped {
+			break // nothing left that may be dropped
+		}
+	}
+	return keep
+}
+
+func connectionColumns(width int) []table.Column {
+	keep := columnsKept(width)
+
+	total := func() int {
+		sum := 0
+		for i, c := range connColumns {
+			if keep[i] {
+				sum += c.width + tableCellPadding
+			}
+		}
+		return sum
+	}
+
+	var cols []table.Column
+	for i, c := range connColumns {
+		if keep[i] {
+			cols = append(cols, table.Column{Title: c.title, Width: c.width})
+		}
+	}
+
+	// Still too wide with the minimum set — shrink the remaining columns
+	// proportionally rather than letting the panel wrap.
+	if width > 0 {
+		if over := total() - width; over > 0 {
+			for i := range cols {
+				share := over / len(cols)
+				if i == 0 {
+					share += over % len(cols)
+				}
+				if cols[i].Width-share < 3 {
+					cols[i].Width = 3
+				} else {
+					cols[i].Width -= share
+				}
+			}
+		}
+	}
+	return cols
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────
+
+func (m Model) Init() tea.Cmd {
+	// Start data ticker + ping ticker + session ticker + initial ping
+	cmds := []tea.Cmd{tickCmd(), pingTickCmd(), sessionTickCmd()}
+	for i, c := range m.clients {
+		cmds = append(cmds, pingServerCmd(c, i))
+	}
+	return tea.Batch(cmds...)
+}
+
+// ── Update ────────────────────────────────────────────────────────────────
+
+func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var cmd tea.Cmd
+
+	switch msg := msg.(type) {
+
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		tableH := m.height - 15
+		if tableH < 2 {
+			tableH = 2
+		}
+		m.connTable.SetHeight(tableH)
+		// Rebuild the columns for the new width: the table does not reflow on
+		// its own, so without this the panel keeps whatever layout it was born
+		// with regardless of the terminal it ends up in.
+		m.connTable.SetColumns(connectionColumns(m.connPanelWidth()))
+		if d, ok := m.selectedData(); ok {
+			// Rows carry one cell per column, so they have to be rebuilt with
+			// the columns — a longer row makes the bubbles table panic.
+			m.connTable.SetRows(connectionRows(d.sessions, m.connPanelWidth()))
+		}
+		m.scratchpad.Resize(m.width, m.height)
+
+	// ── ping result: detect offline→online transition ─────────────────────
+	case pingResultMsg:
+		if msg.idx >= len(m.clients) {
+			return m, nil
+		}
+		nowOnline := msg.err == nil
+		justConnected := nowOnline && msg.idx < len(m.wasOnline) && !m.wasOnline[msg.idx]
+		if msg.idx < len(m.wasOnline) {
+			m.wasOnline[msg.idx] = nowOnline
+		}
+		// Only on a fresh connection do we pull catalog + sessions (catalog is
+		// relatively static, so this avoids re-fetching it on every ping).
+		if justConnected && m.clients[msg.idx].HasCLI() {
+			c := m.clients[msg.idx]
+			return m, tea.Batch(fetchSessionsCmd(c, msg.idx), fetchCatalogCmd(c, msg.idx))
+		}
+		return m, nil
+
+	// ── ping ticker: cheap TCP check for every server ──────────────────────
+	case pingTickMsg:
+		cmds := []tea.Cmd{pingTickCmd()}
+		for i, c := range m.clients {
+			cmds = append(cmds, pingServerCmd(c, i))
+		}
+		return m, tea.Batch(cmds...)
+
+	// ── session ticker: refresh sessions for ONLINE servers only ───────────
+	case sessionTickMsg:
+		cmds := []tea.Cmd{sessionTickCmd()}
+		for i, c := range m.clients {
+			if c.GetState().Online && c.HasCLI() {
+				cmds = append(cmds, fetchSessionsCmd(c, i))
+			}
+		}
+		return m, tea.Batch(cmds...)
+
+	// ── live session results ───────────────────────────────────────────────
+	case sessionResultMsg:
+		// A result can arrive after its connection was deleted, in which case
+		// the index no longer refers to the server that produced it.
+		if msg.idx < 0 || msg.idx >= len(m.data) {
+			return m, nil
+		}
+		d := &m.data[msg.idx]
+		d.sessionsAt = time.Now()
+		if msg.err != nil {
+			d.sessionErr = msg.err.Error()
+			return m, nil
+		}
+		// The result is applied even when it is empty, so rows that no longer
+		// exist stop being shown as though they were live.
+		d.sessionErr = ""
+		d.reportedCount = msg.reportedCount
+		d.sessions = msg.connections
+		if msg.idx == m.selected {
+			m.connTable.SetRows(connectionRows(d.sessions, m.connPanelWidth()))
+		}
+		return m, nil
+
+	// ── live catalog results ───────────────────────────────────────────────
+	case catalogResultMsg:
+		if msg.idx < 0 || msg.idx >= len(m.data) {
+			return m, nil
+		}
+		d := &m.data[msg.idx]
+		d.catalogAt = time.Now()
+		if msg.err != nil {
+			d.catalogErr = msg.err.Error()
+			return m, nil
+		}
+		d.catalogErr = ""
+		d.catalog = msg.catalog
+		return m, nil
+
+	// ── data ticker ───────────────────────────────────────────────────────
+	case tickMsg:
+		m.tick++
+		var tmCmd tea.Cmd
+		m.tokenMgr, tmCmd = m.tokenMgr.Update(msg)
+		var authCmd tea.Cmd
+		m.authEditor, authCmd = m.authEditor.Update(msg)
+		return m, tea.Batch(tickCmd(), tmCmd, authCmd)
+
+	// ── query result (scratchpad async) ───────────────────────────────────
+	case queryResultMsg:
+		var spCmd tea.Cmd
+		m.scratchpad, spCmd = m.scratchpad.Update(msg)
+		return m, spCmd
+
+	// ── snapshot results (ducklake) ───────────────────────────────────────
+	case snapshotsResultMsg:
+		var snapCmd tea.Cmd
+		m.snapshots, snapCmd = m.snapshots.Update(msg)
+		return m, snapCmd
+
+	// ── quack log results ─────────────────────────────────────────────────
+	case logsResultMsg:
+		var logCmd tea.Cmd
+		m.logs, logCmd = m.logs.Update(msg)
+		return m, logCmd
+
+	case logsEnabledMsg:
+		var logCmd tea.Cmd
+		m.logs, logCmd = m.logs.Update(msg)
+		return m, logCmd
+
+	// ── auth policy apply result ──────────────────────────────────────────
+	case authApplyResultMsg:
+		var authCmd tea.Cmd
+		m.authEditor, authCmd = m.authEditor.Update(msg)
+		return m, authCmd
+
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "ctrl+c":
+			// While a query is in flight, ctrl+c interrupts it rather than
+			// quitting — the psql convention, and previously the only way to
+			// escape a slow query was to kill the whole app.
+			if m.currentView == viewScratchpad && m.scratchpad.Running() {
+				var spCmd tea.Cmd
+				m.scratchpad, spCmd = m.scratchpad.Update(msg)
+				return m, spCmd
+			}
+			return m, tea.Quit
+		}
+
+		switch m.currentView {
+
+		case viewDashboard:
+			switch msg.String() {
+			case "q":
+				return m, tea.Quit
+			case "t":
+				m.currentView = viewTokens
+				return m, nil
+			case "s":
+				m.currentView = viewScratchpad
+				m.scratchpad.Resize(m.width, m.height)
+				return m, nil
+			case "a":
+				m.addForm = newAddServerForm()
+				m.currentView = viewAddServer
+				return m, nil
+			case "p":
+				m.authEditor = NewAuthEditor(m.tokenMgr.tokens, m.clients)
+				m.currentView = viewAuth
+				return m, nil
+			case "l":
+				// Rebuild from current clients (configs may have changed)
+				m.snapshots = NewSnapshotsView(m.clients)
+				m.currentView = viewSnapshots
+				if m.snapshots.HasLake() {
+					m.snapshots.loading = true
+					return m, m.snapshots.FetchCmd()
+				}
+				return m, nil
+			case "L":
+				// Rebuilt from current clients, like the snapshots screen.
+				m.logs = NewLogsView(m.clients)
+				m.currentView = viewLogs
+				if m.logs.HasTarget() {
+					m.logs.loading = true
+					return m, m.logs.FetchCmd()
+				}
+				return m, nil
+
+			case "x":
+				m.tlsGen.SetWidth(m.width)
+				m.currentView = viewTLS
+				return m, nil
+			case "tab", "shift+tab":
+				if m.focus == panelConnections {
+					m.focus = panelCatalog
+					m.connTable.Blur()
+				} else {
+					m.focus = panelConnections
+					m.connTable.Focus()
+				}
+				return m, nil
+			case "r":
+				// Refresh every online connection. Each result is attributed to
+				// the connection that produced it, so this no longer races.
+				var cmds []tea.Cmd
+				for i, c := range m.clients {
+					if c.GetState().Online && c.HasCLI() {
+						cmds = append(cmds, fetchSessionsCmd(c, i), fetchCatalogCmd(c, i))
+					}
+				}
+				return m, tea.Batch(cmds...)
+
+			// Which connection the panels describe. ] / [ cycle, and the digits
+			// dial one directly.
+			case "]", "}":
+				m.cycleConnection(1)
+				return m, nil
+			case "[", "{":
+				m.cycleConnection(-1)
+				return m, nil
+			case "1", "2", "3", "4", "5", "6", "7", "8", "9":
+				m.selectConnection(int(msg.String()[0] - '1'))
+				return m, nil
+			}
+
+		case viewTokens:
+			if msg.String() == "esc" &&
+				m.tokenMgr.form == nil && !m.tokenMgr.rotateConfirm && !m.tokenMgr.revokeConfirm &&
+				m.tokenMgr.secretForm == nil && !m.tokenMgr.secretDelConfirm {
+				// Sync any storage-secret edits back to the model and rebuild
+				// clients so their resolvers see the latest secret values.
+				if !quack.StorageSecretsEqual(m.storageSecrets, m.tokenMgr.secrets) {
+					m.storageSecrets = append([]quack.StorageSecret(nil), m.tokenMgr.secrets...)
+					m.clients = quack.InitClients(m.configs, m.storageSecrets)
+				}
+				m.currentView = viewDashboard
+				return m, nil
+			}
+			var tmCmd tea.Cmd
+			m.tokenMgr, tmCmd = m.tokenMgr.Update(msg)
+			return m, tmCmd
+
+		case viewScratchpad:
+			if msg.String() == "esc" {
+				// esc cancels a running query before it leaves the screen, so
+				// there is an interrupt that carries no risk of quitting.
+				if m.scratchpad.Running() {
+					var spCmd tea.Cmd
+					m.scratchpad, spCmd = m.scratchpad.Update(msg)
+					return m, spCmd
+				}
+				m.currentView = viewDashboard
+				return m, nil
+			}
+			var spCmd tea.Cmd
+			m.scratchpad, spCmd = m.scratchpad.Update(msg)
+			return m, spCmd
+
+		case viewTLS:
+			if msg.String() == "esc" {
+				m.currentView = viewDashboard
+				return m, nil
+			}
+			var tlsCmd tea.Cmd
+			m.tlsGen, tlsCmd = m.tlsGen.Update(msg)
+			return m, tlsCmd
+
+		case viewAuth:
+			if msg.String() == "esc" {
+				// Write permission toggles back to the tokens they came from,
+				// and persist. Leaving this screen used to discard every edit.
+				if m.authEditor.Dirty() {
+					m.applyAuthEdits()
+				}
+				m.currentView = viewDashboard
+				return m, nil
+			}
+			var authCmd tea.Cmd
+			m.authEditor, authCmd = m.authEditor.Update(msg)
+			return m, authCmd
+
+		case viewSnapshots:
+			if msg.String() == "esc" {
+				m.currentView = viewDashboard
+				return m, nil
+			}
+			var snapCmd tea.Cmd
+			m.snapshots, snapCmd = m.snapshots.Update(msg)
+			return m, snapCmd
+
+		case viewLogs:
+			if msg.String() == "esc" {
+				m.currentView = viewDashboard
+				return m, nil
+			}
+			var logCmd tea.Cmd
+			m.logs, logCmd = m.logs.Update(msg)
+			return m, logCmd
+
+		case viewAddServer:
+			return m.updateAddServer(msg)
+		}
+	}
+
+	if m.currentView == viewDashboard && m.focus == panelConnections {
+		m.connTable, cmd = m.connTable.Update(msg)
+	}
+	return m, cmd
+}
+
+// updateAddServer handles key input on the connection manager form.
+//
+// Focus modes:
+//
+//	-2 = connection list (left panel)  — supports e (edit), d (delete), ↑↓
+//	-1 = type selector at top of form  — ←→ / space cycles
+//	 0..N-1 = visible form field index — typed input
+func (m Model) updateAddServer(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// The screen is only ever opened alongside a form, but nil-dereferencing on a
+	// keypress is a crash waiting for the next refactor to reach it.
+	if m.addForm == nil {
+		m.currentView = viewDashboard
+		return m, nil
+	}
+	f := m.addForm
+	visible := f.visibleFields()
+
+	// ── list-focus mode ───────────────────────────────────────────────────
+	if f.focusIdx == -2 {
+		switch msg.String() {
+		case "esc":
+			m.addForm = nil
+			m.currentView = viewDashboard
+			return m, nil
+		case "tab", "right":
+			f.focusIdx = -1
+			return m, nil
+		case "up", "k":
+			if f.listCursor > 0 {
+				f.listCursor--
+			}
+			return m, nil
+		case "down", "j":
+			if f.listCursor < len(m.configs)-1 {
+				f.listCursor++
+			}
+			return m, nil
+		case "e":
+			if f.listCursor < len(m.configs) {
+				m.addForm = formFromConfig(m.configs[f.listCursor], f.listCursor)
+			}
+			return m, nil
+		case "d":
+			if f.listCursor < len(m.configs) && len(m.configs) > 1 {
+				m.configs = append(m.configs[:f.listCursor], m.configs[f.listCursor+1:]...)
+				if f.listCursor < len(m.wasOnline) {
+					m.wasOnline = append(m.wasOnline[:f.listCursor], m.wasOnline[f.listCursor+1:]...)
+				}
+				// Drop this connection's metadata so the remaining entries stay
+				// aligned with the connections they describe.
+				m.removeConnData(f.listCursor)
+				m.syncConnData()
+				m.selectConnection(m.selected)
+				m.clients = quack.InitClients(m.configs, m.storageSecrets)
+				servers := make([]quack.ServerInfo, len(m.configs))
+				for i, c := range m.configs {
+					servers[i] = c.ToServerInfo()
+				}
+				m.scratchpad.SetTargets(servers, m.clients)
+				quack.SaveServerConfigs(m.configs)
+				if f.listCursor >= len(m.configs) && f.listCursor > 0 {
+					f.listCursor--
+				}
+			}
+			return m, nil
+		}
+		return m, nil
+	}
+
+	// ── form-focus mode (type selector + fields) ──────────────────────────
+	switch msg.String() {
+	case "esc":
+		// Return to the list view rather than exiting the whole screen.
+		// Cancels any in-progress edit / new connection but preserves
+		// which row in the list the user had highlighted.
+		prevCursor := f.listCursor
+		fresh := newAddServerForm()
+		fresh.focusIdx = -2
+		fresh.listCursor = prevCursor
+		m.addForm = fresh
+		return m, nil
+
+	case "tab", "down":
+		visible := f.visibleFields()
+		// Path-completion: on a path-like field, tab first tries to complete
+		// the partial path via glob. Only advances to the next field when the
+		// value has no further completion available.
+		if f.focusIdx >= 0 && f.focusIdx < len(visible) {
+			fld := visible[f.focusIdx]
+			if isPathField(fld.label) && *fld.value != "" {
+				completed := completePath(*fld.value)
+				if completed != *fld.value {
+					*fld.value = completed
+					return m, nil
+				}
+			}
+		}
+		// Advance — wrap from the last field back to the list panel.
+		if f.focusIdx < len(visible)-1 {
+			f.focusIdx++
+		} else {
+			f.focusIdx = -2
+		}
+		return m, nil
+
+	case "shift+tab", "up":
+		if f.focusIdx > -1 {
+			f.focusIdx--
+		}
+		return m, nil
+
+	case "left":
+		if f.focusIdx == -1 {
+			// Cycle type backwards
+			for i := 0; i < len(quack.AllConnTypes)-1; i++ {
+				f.connType = f.connType.Next()
+			}
+		} else if f.focusIdx == 0 {
+			// From first field, ←  jumps to the connection list
+			f.focusIdx = -2
+		}
+		return m, nil
+
+	case "shift+left":
+		// Cycle type backwards from anywhere in the form (any field, type row,
+		// or even the connection list). Clamps focus to a valid field for the
+		// new type so we don't end up out-of-bounds when types have different
+		// field counts.
+		for i := 0; i < len(quack.AllConnTypes)-1; i++ {
+			f.connType = f.connType.Next()
+		}
+		if f.focusIdx >= 0 {
+			if visible := f.visibleFields(); f.focusIdx >= len(visible) {
+				f.focusIdx = len(visible) - 1
+			}
+		}
+		return m, nil
+
+	case "shift+right":
+		// Cycle type forward from anywhere in the form.
+		f.connType = f.connType.Next()
+		if f.focusIdx >= 0 {
+			if visible := f.visibleFields(); f.focusIdx >= len(visible) {
+				f.focusIdx = len(visible) - 1
+			}
+		}
+		return m, nil
+
+	case "right":
+		// Only meaningful on the type row. On a text field it used to append a
+		// space, so pressing → while editing silently corrupted the value.
+		if f.focusIdx == -1 {
+			f.connType = f.connType.Next()
+		}
+		return m, nil
+
+	case " ":
+		if f.focusIdx == -1 {
+			f.connType = f.connType.Next()
+			return m, nil
+		}
+		if f.focusIdx >= 0 && f.focusIdx < len(visible) {
+			fld := visible[f.focusIdx]
+			*fld.value += " "
+		}
+		return m, nil
+
+	case "enter":
+		if f.focusIdx == -1 {
+			f.focusIdx = 0
+			return m, nil
+		}
+		if f.focusIdx < len(visible)-1 {
+			f.focusIdx++
+			return m, nil
+		}
+		if problem := f.problem(m.configs, m.storageSecrets); problem != "" {
+			f.errMsg = problem
+			return m, nil
+		}
+		f.errMsg = ""
+		cfg := f.toConfig()
+		if f.editingIdx >= 0 && f.editingIdx < len(m.configs) {
+			m.configs[f.editingIdx] = cfg
+		} else {
+			m.configs = append(m.configs, cfg)
+			m.wasOnline = append(m.wasOnline, false)
+		}
+		// Rebuild all clients so the shared resolver sees the latest configs.
+		// This matters for DuckLake configs that reference others by name.
+		m.clients = quack.InitClients(m.configs, m.storageSecrets)
+		m.syncConnData()
+
+		servers := make([]quack.ServerInfo, len(m.configs))
+		for i, c := range m.configs {
+			servers[i] = c.ToServerInfo()
+		}
+		m.scratchpad.SetTargets(servers, m.clients)
+
+		quack.SaveServerConfigs(m.configs)
+		savedIdx := len(m.clients) - 1
+		if f.editingIdx >= 0 {
+			savedIdx = f.editingIdx
+		}
+		m.addForm = nil
+		m.currentView = viewDashboard
+		return m, pingServerCmd(m.clients[savedIdx], savedIdx)
+
+	case "backspace":
+		if f.focusIdx >= 0 && f.focusIdx < len(visible) {
+			fld := visible[f.focusIdx]
+			if len(*fld.value) > 0 {
+				*fld.value = (*fld.value)[:len(*fld.value)-1]
+			}
+		}
+		return m, nil
+
+	default:
+		if f.focusIdx >= 0 && f.focusIdx < len(visible) && len(msg.String()) == 1 {
+			fld := visible[f.focusIdx]
+			*fld.value += msg.String()
+		}
+	}
+	return m, nil
+}
+
+// applyAuthEdits copies permission toggles from the auth editor onto the
+// matching tokens and persists them. The editor is rebuilt from the token list
+// each time the screen opens, so without this step the toggles were lost the
+// moment the user pressed esc.
+func (m *Model) applyAuthEdits() {
+	perms := m.authEditor.Permissions()
+	changed := false
+	for i := range m.tokenMgr.tokens {
+		ops, ok := perms[m.tokenMgr.tokens[i].Name]
+		if !ok {
+			continue
+		}
+		if len(ops) == 0 {
+			ops = []string{}
+		}
+		if !sameStrings(m.tokenMgr.tokens[i].Permissions, ops) {
+			m.tokenMgr.tokens[i].Permissions = ops
+			changed = true
+		}
+	}
+	if changed {
+		m.tokenMgr.persist("permissions updated")
+	}
+}
+
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// ── View dispatch ─────────────────────────────────────────────────────────
+
+func (m Model) View() string {
+	if m.width == 0 {
+		return "Initializing Pintail…"
+	}
+	return clampLines(m.view(), m.width)
+}
+
+// clampLines cuts every line to w terminal cells.
+//
+// A line wider than the terminal wraps, which pushes everything after it down
+// the screen and corrupts the layout — one overlong panel makes the whole frame
+// look broken. Individual views truncate their own content, but they compose
+// through lipgloss.JoinVertical/JoinHorizontal, which pad to the widest line, so
+// this is the one place the invariant can be stated for all of them.
+//
+// It is a backstop, not a substitute for a view sizing its content: cutting here
+// loses whatever was past the edge. A test sweeps every screen at every width to
+// keep views from relying on it.
+func clampLines(s string, w int) string {
+	if w <= 0 {
+		return s
+	}
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		if ansi.StringWidth(line) > w {
+			lines[i] = ansi.Truncate(line, w, "")
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) view() string {
+	switch m.currentView {
+	case viewTokens:
+		return m.viewTokenManager()
+	case viewScratchpad:
+		return m.viewScratchpadScreen()
+	case viewAddServer:
+		return m.viewAddServerScreen()
+	case viewTLS:
+		return m.viewTLSScreen()
+	case viewAuth:
+		return m.viewAuthScreen()
+	case viewSnapshots:
+		return m.viewSnapshotsScreen()
+	case viewLogs:
+		return m.viewLogsScreen()
+	default:
+		return m.viewDashboard()
+	}
+}
+
+// ── Dashboard ─────────────────────────────────────────────────────────────
+
+func (m Model) viewDashboard() string {
+	header := m.viewHeader()
+	footer := m.viewDashboardFooter()
+	headerH := lipgloss.Height(header)
+	footerH := lipgloss.Height(footer)
+	panelH := m.height - headerH - footerH
+
+	leftW := (m.width * 60) / 100
+	rightW := m.width - leftW
+
+	body := lipgloss.JoinHorizontal(lipgloss.Top,
+		m.viewConnectionsPanel(leftW, panelH),
+		m.viewCatalogPanel(rightW, panelH),
+	)
+	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
+}
+
+func (m Model) viewHeader() string {
+	titleBar := headerBarStyle.Width(m.width).Render(
+		titleStyle.Render("🦆 Pintail") +
+			mutedStyle.Render("  ─  DuckDB Quack Protocol Manager  ") +
+			mutedStyle.Render(version.Label()),
+	)
+
+	var chips []string
+	for i, cfg := range m.configs {
+		var state quack.ConnState
+		if i < len(m.clients) {
+			state = m.clients[i].GetState()
+		}
+
+		// Status dot
+		var dot string
+		var statusDetail string
+		if state.PingedAt.IsZero() {
+			dot = mutedStyle.Render("◌")
+			statusDetail = mutedStyle.Render(" pinging…")
+		} else if state.Online && state.Method == "uri" {
+			// Reachability was never actually checked for this one — say so
+			// rather than showing a green dot we haven't earned.
+			dot = amberStyle.Render("◍")
+			statusDetail = mutedStyle.Render(" remote path · not probed")
+		} else if state.Online {
+			dot = greenStyle.Render("●")
+			statusDetail = greenStyle.Render(fmt.Sprintf(" %dms", state.Latency.Milliseconds()))
+			// Type-appropriate transport badge
+			switch cfg.Type {
+			case quack.ConnQuack:
+				if cfg.TLS {
+					statusDetail += mutedStyle.Render(" HTTPS")
+				} else {
+					statusDetail += amberStyle.Render(" HTTP ⚠")
+				}
+				// The ping reaches the server's banner endpoint, so we know
+				// whether a Quack server answered or merely something did.
+				if state.Method != "quack" {
+					statusDetail += amberStyle.Render(" unidentified")
+				}
+			case quack.ConnLocal:
+				statusDetail += mutedStyle.Render(" file")
+			case quack.ConnDuckLake:
+				statusDetail += mutedStyle.Render(" ducklake")
+			}
+		} else {
+			dot = redStyle.Render("✕")
+			statusDetail = redStyle.Render(" offline") + mutedStyle.Render("  "+state.ErrMsg)
+		}
+
+		typeBadge := mutedStyle.Render(" [" + string(cfg.Type) + "]")
+
+		// The selected connection is the one the panels below describe, so it
+		// has to be identifiable at a glance — and the digit that selects it is
+		// worth showing while we're here.
+		name := labelStyle.Render(cfg.Name)
+		marker := "  "
+		if i == m.selected {
+			marker = amberStyle.Render("▸ ")
+			name = lipgloss.NewStyle().
+				Foreground(colorDarkBg).Background(colorDuckYellow).Bold(true).
+				Render(" " + cfg.Name + " ")
+		}
+		index := ""
+		if i < 9 {
+			index = mutedStyle.Render(fmt.Sprintf("%d:", i+1))
+		}
+
+		chip := marker + index + dot + " " + name +
+			typeBadge +
+			mutedStyle.Render("  "+truncate(cfg.DisplayURI(), 40)) +
+			statusDetail
+		chips = append(chips, chip)
+	}
+
+	// The summary describes the selected connection, since that is whose
+	// sessions the panel below is listing.
+	connSummary := ""
+	if d, ok := m.selectedData(); ok {
+		activeCount := 0
+		for _, c := range d.sessions {
+			if c.Status == "active" {
+				activeCount++
+			}
+		}
+		connSummary = mutedStyle.Render("  sessions  ") +
+			greenStyle.Render(fmt.Sprintf("%d active", activeCount)) +
+			mutedStyle.Render(fmt.Sprintf(" / %d listed", len(d.sessions)))
+	}
+
+	// Truncate: the chips carry connection names, URIs and offline error
+	// messages, none of which are bounded. Three connections with real hostnames
+	// were enough to push this row past 290 cells, and because JoinVertical pads
+	// every line out to the widest one, an overlong row here dragged the whole
+	// screen past the terminal width.
+	serverRow := truncate("  "+strings.Join(chips, mutedStyle.Render("   ·   "))+connSummary, m.width)
+	divider := mutedStyle.Render(hrule(m.width))
+	return lipgloss.JoinVertical(lipgloss.Left, titleBar, serverRow, divider)
+}
+
+// connPanelWidth is the space the session table has inside the connections
+// panel: the panel takes 60% of the terminal, and the style subtracts two cells
+// for the border plus its own padding.
+//
+// It exists so the resize handler and the panel agree on one number. They did
+// not before — the table was built with fixed widths and the panel with a
+// derived one, so the table overflowed its own box.
+func (m Model) connPanelWidth() int {
+	leftW := (m.width * 60) / 100
+	inner := leftW - 2 - panelStyle.GetHorizontalPadding() - panelStyle.GetHorizontalBorderSize()
+	if inner < 0 {
+		return 0
+	}
+	return inner
+}
+
+func (m Model) viewConnectionsPanel(width, height int) string {
+	d, have := m.selectedData()
+
+	// Name the connection in the title: with several servers configured, an
+	// unlabelled table of sessions says nothing about whose sessions they are.
+	title := labelStyle.Render("ACTIVE CONNECTIONS")
+	if name := m.selectedName(); name != "" {
+		title += mutedStyle.Render("  ·  ") + brightStyle.Render(name)
+	}
+	if have && d.reportedCount != "" {
+		// DuckDB reports a count but cannot enumerate peers, so the count is
+		// labelled as the backend's rather than implied by the row count.
+		title += mutedStyle.Render("   backend reports " + d.reportedCount + " connection(s)")
+	}
+
+	rows := []string{title, ""}
+	if have && d.sessionErr != "" {
+		rows = append(rows,
+			redStyle.Render("✕ session query failed"),
+			mutedStyle.Render("  "+truncate(firstLine(d.sessionErr), width-6)),
+			"")
+	}
+	rows = append(rows, m.connTable.View())
+	content := lipgloss.JoinVertical(lipgloss.Left, rows...)
+	style := panelStyle
+	if m.focus == panelConnections {
+		style = activePanelStyle
+	}
+	return style.Width(width - 2).Height(height - 1).Render(content)
+}
+
+func (m Model) viewCatalogPanel(width, height int) string {
+	d, _ := m.selectedData()
+
+	var lines []string
+	title := labelStyle.Render("CATALOG")
+	if name := m.selectedName(); name != "" {
+		title += mutedStyle.Render("  ·  ") + brightStyle.Render(name)
+	}
+	lines = append(lines, title, "")
+
+	if len(d.catalog) == 0 {
+		if d.catalogErr != "" {
+			lines = append(lines,
+				redStyle.Render("  ✕ catalog query failed"),
+				"",
+				mutedStyle.Render("  "+truncate(firstLine(d.catalogErr), width-6)),
+			)
+		} else {
+			// Split across lines rather than relying on the panel to wrap: at
+			// 110 columns the single-line version wrapped and the continuation
+			// came back unindented, which reads as a layout fault.
+			lines = append(lines,
+				mutedStyle.Render("  ◌ no catalog data"),
+				"",
+				mutedStyle.Render("  populates from duckdb_tables()"),
+				mutedStyle.Render("  and duckdb_views() once a"),
+				mutedStyle.Render("  connection comes online"),
+				"",
+				mutedStyle.Render("  see README §Getting started"),
+			)
+		}
+		style := panelStyle
+		if m.focus == panelCatalog {
+			style = activePanelStyle
+		}
+		return style.Width(width - 2).Height(height - 1).Render(strings.Join(lines, "\n"))
+	}
+
+	for _, schema := range d.catalog {
+		arrow := "▶"
+		if schema.Open {
+			arrow = "▼"
+		}
+		lines = append(lines, amberStyle.Render(arrow+" ")+brightStyle.Bold(true).Render(schema.Name))
+		if schema.Open {
+			for i, tbl := range schema.Tables {
+				conn := "├─"
+				if i == len(schema.Tables)-1 {
+					conn = "└─"
+				}
+				size := ""
+				if tbl.SizeKnown {
+					size = "  " + fmtRows(tbl.Rows)
+				}
+				lines = append(lines,
+					mutedStyle.Render("  "+conn+" ")+
+						brightStyle.Render(tbl.Name)+
+						mutedStyle.Render("  "+tbl.Format)+
+						mutedStyle.Render(size))
+			}
+		}
+		lines = append(lines, "")
+	}
+	style := panelStyle
+	if m.focus == panelCatalog {
+		style = activePanelStyle
+	}
+	return style.Width(width - 2).Height(height - 1).Render(strings.Join(lines, "\n"))
+}
+
+func (m Model) viewDashboardFooter() string {
+	keys := strings.Join([]string{
+		keyBadge("q") + " quit",
+		keyBadge("tab") + " panel",
+		keyBadge("[ ]") + " connection",
+		keyBadge("r") + " refresh",
+		keyBadge("t") + " tokens",
+		keyBadge("s") + " sql",
+		keyBadge("l") + " lake",
+		keyBadge("L") + " logs",
+		keyBadge("x") + " tls",
+		keyBadge("p") + " auth",
+		keyBadge("a") + " conn",
+	}, "  ")
+	var hint string
+	if m.focus == panelConnections {
+		if row := m.connTable.SelectedRow(); len(row) >= 3 {
+			hint = "   " + mutedStyle.Render("│") + "   " +
+				mutedStyle.Render("selected  ") + brightStyle.Render(row[2]) +
+				mutedStyle.Render("  @  "+row[1])
+		}
+	}
+
+	lines := []string{
+		mutedStyle.Render(hrule(m.width)),
+		footerStyle.Render(keys) + hint,
+	}
+
+	// The SQL a session is running is the most useful thing about it and far too
+	// long for a table column. It gets its own line, since the key row already
+	// fills the width; the panels above shrink by one row to make space, which
+	// the layout does on its own from the footer's height.
+	if q := m.selectedSessionQuery(); q != "" {
+		lines = append(lines, footerStyle.Render(
+			mutedStyle.Render("running  ")+amberStyle.Render(truncate(firstLine(q), m.width-12))))
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, lines...)
+}
+
+// ── Add server screen ─────────────────────────────────────────────────────
+
+func (m Model) viewAddServerScreen() string {
+	titleBar := headerBarStyle.Width(m.width).Render(
+		titleStyle.Render("🦆 Pintail") +
+			mutedStyle.Render("  ─  ") +
+			labelStyle.Render("Add Connection") +
+			mutedStyle.Render("  "+version.Label()),
+	)
+	divider := mutedStyle.Render(hrule(m.width))
+
+	// The screen is only ever opened alongside a form, but a view that nil-derefs
+	// is a crash waiting for the next refactor to reach it. Render the empty
+	// state instead of taking the app down.
+	if m.addForm == nil {
+		return lipgloss.JoinVertical(lipgloss.Left, titleBar, divider,
+			"", "  "+mutedStyle.Render("no connection form open — press [esc] to go back"))
+	}
+	f := m.addForm
+	visible := f.visibleFields()
+
+	// Type selector at the top of the form
+	var typeChips []string
+	for _, t := range quack.AllConnTypes {
+		chip := mutedStyle.Render(" " + t.Label() + " ")
+		if t == f.connType {
+			chip = lipgloss.NewStyle().
+				Foreground(colorDarkBg).Background(colorDuckYellow).Bold(true).
+				Padding(0, 1).
+				Render(t.Label())
+		}
+		typeChips = append(typeChips, chip)
+	}
+	typeCursor := "  "
+	if f.focusIdx == -1 {
+		typeCursor = amberStyle.Render("▶ ")
+	}
+	typeLine := typeCursor + mutedStyle.Render(padRight("Type", 8)) +
+		strings.Join(typeChips, mutedStyle.Render("  "))
+
+	// Per-type field rows
+	var fieldLines []string
+	for i, fld := range visible {
+		cursor := "  "
+		if i == f.focusIdx {
+			cursor = amberStyle.Render("▶ ")
+		}
+		val := *fld.value
+		if i == f.focusIdx {
+			val += amberStyle.Render("█")
+		}
+		display := brightStyle.Render(val)
+		if *fld.value == "" {
+			display = mutedStyle.Render(fld.placeholder)
+		}
+		fieldLines = append(fieldLines,
+			cursor+mutedStyle.Render(padRight(fld.label, 8))+display,
+			"    "+mutedStyle.Render(fld.hint),
+		)
+	}
+
+	// Context-aware hint: on path-like fields, mention tab-completion.
+	var hint string
+	onPathField := false
+	if f.focusIdx >= 0 && f.focusIdx < len(visible) {
+		if isPathField(visible[f.focusIdx].label) {
+			onPathField = true
+		}
+	}
+	if onPathField {
+		hint = mutedStyle.Render("  [tab] complete path  [↓] next field  [shift+←→] cycle type  [enter] save  [esc] back")
+	} else {
+		hint = mutedStyle.Render("  [↑↓/tab] field  [shift+←→] cycle type  [enter] advance/save  [esc] back")
+	}
+	if !f.valid() {
+		hint += "  " + redStyle.Render("· required fields missing")
+	}
+	// Why the last save was refused — a duplicate name or a reference that
+	// doesn't resolve, both of which used to be accepted and fail later.
+	if f.errMsg != "" {
+		hint += "\n  " + redStyle.Render("✕ "+f.errMsg)
+	}
+
+	// Existing connections panel (left)
+	existingLines := []string{
+		labelStyle.Render("CONFIGURED CONNECTIONS"),
+		mutedStyle.Render("[↑↓] select  [e] edit  [d] delete  [→] back to form"),
+		"",
+	}
+	for i, cfg := range m.configs {
+		state := m.clients[i].GetState()
+		dot := mutedStyle.Render("◌")
+		if !state.PingedAt.IsZero() {
+			if state.Online {
+				dot = greenStyle.Render("●")
+			} else {
+				dot = redStyle.Render("✕")
+			}
+		}
+		cursor := "  "
+		nameStyle := brightStyle
+		if f.focusIdx == -2 && i == f.listCursor {
+			cursor = amberStyle.Render("▶ ")
+			nameStyle = labelStyle
+		}
+		typeLabel := mutedStyle.Render("[" + string(cfg.Type) + "]")
+		editing := ""
+		if f.editingIdx == i {
+			editing = amberStyle.Render("  (editing)")
+		}
+		existingLines = append(existingLines,
+			cursor+dot+" "+nameStyle.Render(cfg.Name)+"  "+typeLabel+editing,
+			"      "+mutedStyle.Render(truncate(cfg.DisplayURI(), 40)),
+		)
+	}
+
+	leftStyle := panelStyle
+	rightStyle := activePanelStyle
+	if f.focusIdx == -2 {
+		leftStyle = activePanelStyle
+		rightStyle = panelStyle
+	}
+	leftPanel := leftStyle.Width((m.width / 2) - 2).Render(strings.Join(existingLines, "\n"))
+	rightPanel := rightStyle.Width((m.width / 2) - 2).Render(
+		lipgloss.JoinVertical(lipgloss.Left,
+			labelStyle.Render(editingTitle(f)), "",
+			typeLine,
+			"",
+			strings.Join(fieldLines, "\n"),
+			"",
+			hint,
+		),
+	)
+
+	body := lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, rightPanel)
+	footerDiv := mutedStyle.Render(hrule(m.width))
+	footerLine := footerStyle.Render(
+		keyBadge("enter") + " save   " + keyBadge("←") + " connection list   " + keyBadge("esc") + " back",
+	)
+	return lipgloss.JoinVertical(lipgloss.Left, titleBar, divider, body, footerDiv, footerLine)
+}
+
+func editingTitle(f *addServerForm) string {
+	if f.editingIdx >= 0 {
+		return "EDIT CONNECTION"
+	}
+	return "NEW CONNECTION"
+}
+
+// ── DuckLake snapshots screen ─────────────────────────────────────────────
+
+func (m Model) viewSnapshotsScreen() string {
+	titleBar := headerBarStyle.Width(m.width).Render(
+		titleStyle.Render("🦆 Pintail") + mutedStyle.Render("  ─  ") +
+			labelStyle.Render("DuckLake Snapshots") + mutedStyle.Render("  "+version.Label()),
+	)
+	divider := mutedStyle.Render(hrule(m.width))
+	header := lipgloss.JoinVertical(lipgloss.Left,
+		titleBar,
+		m.snapshots.ViewTargetBar(),
+		divider,
+	)
+
+	footerDiv := mutedStyle.Render(hrule(m.width))
+	footer := lipgloss.JoinVertical(lipgloss.Left, footerDiv, m.snapshots.ViewFooter())
+
+	headerH := lipgloss.Height(header)
+	footerH := lipgloss.Height(footer)
+	panelH := m.height - headerH - footerH
+
+	leftW := (m.width * 35) / 100
+	rightW := m.width - leftW
+
+	leftContent := m.snapshots.ViewList(leftW - 4)
+	rightContent := m.snapshots.ViewDetail(rightW - 4)
+
+	leftPanel := activePanelStyle.Width(leftW - 2).Height(panelH - 1).Render(leftContent)
+	rightPanel := panelStyle.Width(rightW - 2).Height(panelH - 1).Render(rightContent)
+
+	body := lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, rightPanel)
+	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
+}
+
+// ── Quack message log screen ──────────────────────────────────────────────
+
+func (m Model) viewLogsScreen() string {
+	titleBar := headerBarStyle.Width(m.width).Render(
+		titleStyle.Render("🦆 Pintail") + mutedStyle.Render("  ─  ") +
+			labelStyle.Render("Quack Message Log") + mutedStyle.Render("  "+version.Label()),
+	)
+	divider := mutedStyle.Render(hrule(m.width))
+	header := lipgloss.JoinVertical(lipgloss.Left, titleBar, m.logs.ViewTargetBar(), divider)
+
+	footerDiv := mutedStyle.Render(hrule(m.width))
+	footer := lipgloss.JoinVertical(lipgloss.Left, footerDiv, m.logs.ViewFooter())
+
+	panelH := m.height - lipgloss.Height(header) - lipgloss.Height(footer)
+
+	// The log is a wide stream, so it gets the full width and the detail for the
+	// selected entry sits underneath rather than beside it.
+	tableH := (panelH * 60) / 100
+	detailH := panelH - tableH
+
+	table := activePanelStyle.Width(m.width - 2).Height(tableH - 2).Render(
+		m.logs.ViewTable(m.width - 6))
+	detail := panelStyle.Width(m.width - 2).Height(detailH - 2).Render(
+		m.logs.ViewDetail(m.width - 6))
+
+	return lipgloss.JoinVertical(lipgloss.Left, header, table, detail, footer)
+}
+
+// ── Auth policy editor screen ─────────────────────────────────────────────
+
+func (m Model) viewAuthScreen() string {
+	titleBar := headerBarStyle.Width(m.width).Render(
+		titleStyle.Render("🦆 Pintail") + mutedStyle.Render("  ─  ") +
+			labelStyle.Render("Auth Policy Editor") + mutedStyle.Render("  "+version.Label()),
+	)
+	divider := mutedStyle.Render(hrule(m.width))
+	header := lipgloss.JoinVertical(lipgloss.Left, titleBar, divider)
+
+	footerDiv := mutedStyle.Render(hrule(m.width))
+	footer := lipgloss.JoinVertical(lipgloss.Left, footerDiv, m.authEditor.ViewFooter())
+
+	headerH := lipgloss.Height(header)
+	footerH := lipgloss.Height(footer)
+	panelH := m.height - headerH - footerH
+
+	leftW := (m.width * 32) / 100
+	rightW := m.width - leftW
+
+	listContent := m.authEditor.ViewPolicyList(leftW-4, panelH)
+	permContent := m.authEditor.ViewPermGrid(rightW - 4)
+
+	leftStyle := panelStyle
+	rightStyle := panelStyle
+	if m.authEditor.focus == 0 {
+		leftStyle = activePanelStyle
+	} else {
+		rightStyle = activePanelStyle
+	}
+
+	leftPanel := leftStyle.Width(leftW - 2).Height(panelH - 1).Render(listContent)
+	rightPanel := rightStyle.Width(rightW - 2).Height(panelH - 1).Render(permContent)
+
+	body := lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, rightPanel)
+	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
+}
+
+// ── TLS config generator screen ───────────────────────────────────────────
+
+func (m Model) viewTLSScreen() string {
+	titleBar := headerBarStyle.Width(m.width).Render(
+		titleStyle.Render("🦆 Pintail") + mutedStyle.Render("  ─  ") +
+			labelStyle.Render("TLS Config Generator") + mutedStyle.Render("  "+version.Label()),
+	)
+	divider := mutedStyle.Render(hrule(m.width))
+	header := lipgloss.JoinVertical(lipgloss.Left, titleBar, divider)
+
+	footerDiv := mutedStyle.Render(hrule(m.width))
+	statusBar := "  " + m.tlsGen.ViewStatusBar()
+	footer := lipgloss.JoinVertical(lipgloss.Left, footerDiv, statusBar, m.tlsGen.ViewFooter())
+
+	headerH := lipgloss.Height(header)
+	footerH := lipgloss.Height(footer)
+	panelH := m.height - headerH - footerH
+
+	formW := (m.width * 38) / 100
+	configW := m.width - formW
+
+	formContent := m.tlsGen.ViewForm(formW - 4)
+	formPanel := panelStyle.Width(formW - 2).Height(panelH - 1).Render(formContent)
+
+	configPanel := activePanelStyle.Width(configW - 2).Height(panelH - 1).Render(
+		m.tlsGen.ViewConfig(),
+	)
+
+	body := lipgloss.JoinHorizontal(lipgloss.Top, formPanel, configPanel)
+	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
+}
+
+// ── Token manager (mode-aware: dispatches between tokens and secrets) ────
+
+func (m Model) viewTokenManager() string {
+	header := m.viewTokenHeader()
+	footer := m.viewTokenFooter()
+	headerH := lipgloss.Height(header)
+	footerH := lipgloss.Height(footer)
+	panelH := m.height - headerH - footerH
+
+	leftW := (m.width * 30) / 100
+	rightW := m.width - leftW
+
+	var leftContent, rightContent string
+
+	if m.tokenMgr.mode == tmModeSecrets {
+		// Secrets mode
+		leftContent = m.tokenMgr.ViewSecretList(leftW-4, panelH)
+		switch {
+		case m.tokenMgr.secretForm != nil:
+			rightContent = lipgloss.JoinVertical(lipgloss.Left,
+				m.tokenMgr.ViewSecretDetail(rightW-6), "",
+				lipgloss.PlaceHorizontal(rightW-4, lipgloss.Center,
+					m.tokenMgr.ViewSecretForm(rightW-12, panelH)),
+			)
+		case m.tokenMgr.secretDelConfirm:
+			sel := m.tokenMgr.selectedSecret()
+			name := ""
+			if sel != nil {
+				name = sel.Name
+			}
+			rightContent = lipgloss.JoinVertical(lipgloss.Left,
+				m.tokenMgr.ViewSecretDetail(rightW-6), "",
+				lipgloss.PlaceHorizontal(rightW-4, lipgloss.Left,
+					m.tokenMgr.ViewConfirmDialog("Delete secret",
+						fmt.Sprintf("Delete the secret  %s?\nConnections that reference it will fail until reconfigured.", name)),
+				))
+		default:
+			rightContent = m.tokenMgr.ViewSecretDetail(rightW - 6)
+		}
+	} else {
+		// Tokens mode (original behaviour)
+		leftContent = m.tokenMgr.ViewTokenList(leftW-4, panelH)
+		switch {
+		case m.tokenMgr.form != nil:
+			rightContent = lipgloss.JoinVertical(lipgloss.Left,
+				m.tokenMgr.ViewTokenDetail(rightW-6), "",
+				lipgloss.PlaceHorizontal(rightW-4, lipgloss.Center, m.tokenMgr.ViewForm(rightW, panelH)),
+			)
+		case m.tokenMgr.rotateConfirm:
+			sel := m.tokenMgr.selectedToken()
+			name := ""
+			if sel != nil {
+				name = sel.Name
+			}
+			rightContent = lipgloss.JoinVertical(lipgloss.Left,
+				m.tokenMgr.ViewTokenDetail(rightW-6), "",
+				lipgloss.PlaceHorizontal(rightW-4, lipgloss.Left,
+					m.tokenMgr.ViewConfirmDialog("Rotate token",
+						fmt.Sprintf("Generate a new value for  %s?\nThe old value will stop working immediately.", name)),
+				))
+		case m.tokenMgr.revokeConfirm:
+			sel := m.tokenMgr.selectedToken()
+			name := ""
+			if sel != nil {
+				name = sel.Name
+			}
+			rightContent = lipgloss.JoinVertical(lipgloss.Left,
+				m.tokenMgr.ViewTokenDetail(rightW-6), "",
+				lipgloss.PlaceHorizontal(rightW-4, lipgloss.Left,
+					m.tokenMgr.ViewConfirmDialog("Revoke token",
+						fmt.Sprintf("Permanently revoke  %s?\nAll connections using it will be dropped.", name)),
+				))
+		default:
+			rightContent = m.tokenMgr.ViewTokenDetail(rightW - 6)
+		}
+	}
+
+	leftPanel := panelStyle.Width(leftW - 2).Height(panelH - 1).Render(leftContent)
+	rightPanel := activePanelStyle.Width(rightW - 2).Height(panelH - 1).Render(rightContent)
+	body := lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, rightPanel)
+	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
+}
+
+func (m Model) viewTokenHeader() string {
+	titleBar := headerBarStyle.Width(m.width).Render(
+		titleStyle.Render("🦆 Pintail") + mutedStyle.Render("  ─  ") +
+			labelStyle.Render("Token Manager") + mutedStyle.Render("  "+version.Label()),
+	)
+	activeTokens := 0
+	for _, t := range m.tokenMgr.tokens {
+		if t.Active {
+			activeTokens++
+		}
+	}
+	statRow := "  " +
+		mutedStyle.Render("tokens  ") +
+		greenStyle.Render(fmt.Sprintf("%d active", activeTokens)) +
+		mutedStyle.Render(fmt.Sprintf(" / %d total", len(m.tokenMgr.tokens)))
+	divider := mutedStyle.Render(hrule(m.width))
+	return lipgloss.JoinVertical(lipgloss.Left, titleBar, statRow, divider)
+}
+
+func (m Model) viewTokenFooter() string {
+	divider := mutedStyle.Render(hrule(m.width))
+	return lipgloss.JoinVertical(lipgloss.Left, divider, m.tokenMgr.ViewFooter())
+}
+
+// ── Scratchpad screen ─────────────────────────────────────────────────────
+
+func (m Model) viewScratchpadScreen() string {
+	titleBar := headerBarStyle.Width(m.width).Render(
+		titleStyle.Render("🦆 Pintail") + mutedStyle.Render("  ─  ") +
+			labelStyle.Render("SQL Scratchpad") + mutedStyle.Render("  "+version.Label()),
+	)
+	divider := mutedStyle.Render(hrule(m.width))
+	header := lipgloss.JoinVertical(lipgloss.Left, titleBar, divider)
+
+	footerDivider := mutedStyle.Render(hrule(m.width))
+	footer := lipgloss.JoinVertical(lipgloss.Left, footerDivider, m.scratchpad.ViewFooter())
+
+	return lipgloss.JoinVertical(lipgloss.Left,
+		header,
+		m.scratchpad.ViewEditor(),
+		"",
+		m.scratchpad.ViewResultsStatus(),
+		m.scratchpad.ViewResults(),
+		footer,
+	)
+}
+
+// ── format helpers ────────────────────────────────────────────────────────
+
+// connectionRows renders the sessions as table rows.
+//
+// width must match what was passed to connectionColumns, because the cells are
+// selected by the same rule: the bubbles table indexes each row per column and
+// panics outright on a row with more cells than there are columns.
+func connectionRows(conns []quack.Connection, width int) []table.Row {
+	keep := columnsKept(width)
+	rows := make([]table.Row, len(conns))
+	for i, c := range conns {
+		all := []string{
+			c.ID, c.IP, c.Identity, c.Catalog,
+			fmtDuration(c.Duration), fmt.Sprintf("%d", c.Queries),
+			statusGlyph(c.Status) + c.Status,
+		}
+		row := make(table.Row, 0, len(all))
+		for j, cell := range all {
+			if keep[j] {
+				row = append(row, cell)
+			}
+		}
+		rows[i] = row
+	}
+	return rows
+}
+
+// statusGlyph marks the session states quack_active_connections() reports.
+func statusGlyph(s string) string {
+	switch s {
+	case "active":
+		return "● "
+	case "idle":
+		return "◌ "
+	case "finished":
+		return "✓ "
+	case "cancelled":
+		return "⊘ "
+	case "error":
+		return "✕ "
+	case "unknown":
+		// What the extension reports for a state it does not recognise — which
+		// is how a state added in a later Quack arrives here. Give it a mark of
+		// its own rather than the blank that reads as "no data".
+		return "? "
+	}
+	return "  "
+}
+
+func fmtDuration(d time.Duration) string {
+	h := int(d.Hours())
+	mn := int(d.Minutes()) % 60
+	sc := int(d.Seconds()) % 60
+	if h > 0 {
+		return fmt.Sprintf("%dh%02dm", h, mn)
+	}
+	if mn > 0 {
+		return fmt.Sprintf("%dm%02ds", mn, sc)
+	}
+	return fmt.Sprintf("%ds", sc)
+}
+
+func fmtRows(n int64) string {
+	switch {
+	case n >= 1_000_000_000:
+		return fmt.Sprintf("%.1fB rows", float64(n)/1_000_000_000)
+	case n >= 1_000_000:
+		return fmt.Sprintf("%.1fM rows", float64(n)/1_000_000)
+	case n >= 1_000:
+		return fmt.Sprintf("%.1fK rows", float64(n)/1_000)
+	}
+	return fmt.Sprintf("%d rows", n)
+}

@@ -1,0 +1,18 @@
+[
+  {"timestamp":"2026-08-14 09:06:19.841623+02","type":"Quack","log_level":"DEBUG",
+   "message_type":"PREPARE_REQUEST","quack_connection_id":"091A003553E7E67B615B73D6BE81FD2E",
+   "client_query_id":18,"query":"SELECT count(*) FROM orders","server":"http://localhost:9494",
+   "duration_ms":41,"response_type":"PREPARE_RESPONSE","error":null},
+  {"timestamp":"2026-08-14 09:06:20.100000+02","type":"Quack","log_level":"DEBUG",
+   "message_type":"FETCH_REQUEST","quack_connection_id":"091A003553E7E67B615B73D6BE81FD2E",
+   "client_query_id":19,"query":null,"server":"http://localhost:9494",
+   "duration_ms":3,"response_type":"FETCH_RESPONSE","error":null},
+  {"timestamp":"2026-08-14 09:06:21.000000+02","type":"Quack","log_level":"ERROR",
+   "message_type":"PREPARE_REQUEST","quack_connection_id":"091A003553E7E67B615B73D6BE81FD2E",
+   "client_query_id":20,"query":"SELECT nope FROM orders","server":"http://localhost:9494",
+   "duration_ms":1,"response_type":"ERROR","error":"Binder Error: nope not found"},
+  {"timestamp":"2026-08-14 09:06:22.000000+02","type":"Quack","log_level":"DEBUG",
+   "message_type":"PREPARE_REQUEST","quack_connection_id":"091A003553E7E67B615B73D6BE81FD2E",
+   "client_query_id":21,"query":"SELECT * FROM duckdb_logs_parsed('Quack') ORDER BY timestamp DESC LIMIT 200",
+   "server":"http://localhost:9494","duration_ms":2,"response_type":"PREPARE_RESPONSE","error":null}
+]
