@@ -255,3 +255,216 @@ func TestSameStrings(t *testing.T) {
 		}
 	}
 }
+
+// Quack runs exactly one authorization callback per server, so an apply
+// overwrites whatever is installed. Replacing another tool's — or a
+// hand-deployed — access control without asking is not Pintail's call, so a
+// foreign hook aborts the apply and is reported.
+func TestAuthEditorRefusesToOverwriteAForeignHook(t *testing.T) {
+	a := NewAuthEditor([]Token{buildToken("t", "*", "SELECT", "never")}, nil)
+
+	a, _ = a.Update(authApplyResultMsg{target: "quack-a", conflict: "acme_authz"})
+	if !a.applyIsErr {
+		t.Error("a conflict must be reported as an error")
+	}
+	for _, want := range []string{"acme_authz", "not overwriting", "[R]"} {
+		if !strings.Contains(a.applyMsg, want) {
+			t.Errorf("conflict message %q is missing %q", a.applyMsg, want)
+		}
+	}
+}
+
+// The default is a named allow-all callback, not an empty setting, so treating
+// "" as the only unset value would make every fresh server look like it already
+// had a policy and block the first apply.
+func TestAuthzDefaultIsNotEmpty(t *testing.T) {
+	if authzDefault != "quack_nop_authorization" {
+		t.Errorf("authzDefault = %q; Quack ships quack_nop_authorization as the default hook",
+			authzDefault)
+	}
+	if authzSetting != "quack_authorization_function" {
+		t.Errorf("authzSetting = %q, want quack_authorization_function", authzSetting)
+	}
+}
+
+// Quack hands the whole query string to the hook, and Pintail's management
+// script starts with CREATE. A policy denying CREATE therefore denies the next
+// apply, which makes it effectively one-way — so it needs saying up front and
+// confirming before it goes out.
+func TestApplyConfirmsAPolicyThatLocksPintailOut(t *testing.T) {
+	quack := onlineQuackClient("q")
+
+	// SELECT only: CREATE denied, so this is the one-way case.
+	a := NewAuthEditor([]Token{buildToken("t", "*", "SELECT", "never")}, []*QuackClient{quack})
+	a.focus = 1
+
+	if !policyLocksOutPintail(a.policies[0]) {
+		t.Fatal("a SELECT-only policy denies CREATE and should be flagged")
+	}
+
+	// The warning is on screen before any key is pressed.
+	grid := a.ViewPermGrid(100)
+	if !strings.Contains(grid, "one-way") {
+		t.Errorf("the perm grid does not warn that the policy is one-way:\n%s", grid)
+	}
+
+	// First [a] arms the confirmation and sends nothing.
+	a, cmd := a.Update(key("a"))
+	if cmd != nil {
+		t.Error("the first apply of a one-way policy must not send anything")
+	}
+	if !a.confirmApply {
+		t.Error("confirmation was not armed")
+	}
+	if !strings.Contains(a.applyMsg, "confirm") {
+		t.Errorf("applyMsg = %q, want it to ask for confirmation", a.applyMsg)
+	}
+
+	// A different key cancels rather than leaving the prompt armed.
+	cancelled, _ := a.Update(key("j"))
+	if cancelled.confirmApply {
+		t.Error("an unrelated key should abandon the pending confirmation")
+	}
+
+	// Second [a] goes through.
+	a, cmd = a.Update(key("a"))
+	if cmd == nil {
+		t.Error("the confirmed apply should send the policy")
+	}
+	if a.confirmApply {
+		t.Error("confirmation should be cleared once the apply is sent")
+	}
+}
+
+// A policy that allows CREATE can be replaced by a later apply, so it needs no
+// confirmation and must not be labelled one-way.
+func TestApplyDoesNotConfirmAReversiblePolicy(t *testing.T) {
+	quack := onlineQuackClient("q")
+
+	a := NewAuthEditor([]Token{buildToken("t", "*", "SELECT, CREATE", "never")}, []*QuackClient{quack})
+	a.focus = 1
+
+	if policyLocksOutPintail(a.policies[0]) {
+		t.Fatal("a policy allowing CREATE is reversible and must not be flagged")
+	}
+	if got := a.ViewPermGrid(100); strings.Contains(got, "one-way") {
+		t.Errorf("a reversible policy should not be labelled one-way:\n%s", got)
+	}
+
+	a, cmd := a.Update(key("a"))
+	if cmd == nil {
+		t.Error("a reversible policy should apply on the first keypress")
+	}
+	if a.confirmApply {
+		t.Error("no confirmation should be armed for a reversible policy")
+	}
+}
+
+// The statement-prefix caveat has to be visible on the screen where the toggles
+// are, not only inside the generated SQL further down the panel.
+func TestPermGridStatesItIsNotASecurityBoundary(t *testing.T) {
+	a := NewAuthEditor([]Token{buildToken("t", "*", "SELECT", "never")}, nil)
+	got := a.ViewPermGrid(100)
+
+	for _, want := range []string{"not a security boundary", "prefix", "READ_ONLY"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("perm grid is missing %q:\n%s", want, got)
+		}
+	}
+}
+
+// [R] is the documented way back from a policy that denies CREATE, and it has
+// to be reachable — including being advertised in the footer.
+func TestResetHookIsAvailable(t *testing.T) {
+	quack := onlineQuackClient("q")
+
+	a := NewAuthEditor([]Token{buildToken("t", "*", "SELECT", "never")}, []*QuackClient{quack})
+	a.focus = 1
+
+	if got := a.ViewFooter(); !strings.Contains(got, "reset hook") {
+		t.Errorf("footer does not offer the reset: %s", got)
+	}
+
+	a, cmd := a.Update(key("R"))
+	if cmd == nil {
+		t.Fatal("[R] should issue a reset")
+	}
+	if !strings.Contains(a.applyMsg, authzDefault) {
+		t.Errorf("applyMsg = %q, want it to name the default hook", a.applyMsg)
+	}
+}
+
+func TestHookIsForeign(t *testing.T) {
+	tests := []struct {
+		current string
+		want    bool
+	}{
+		// Quack's shipped default means nothing has been installed. Reading it
+		// as an existing policy would block the first apply on every server.
+		{"quack_nop_authorization", false},
+		{"", false},
+		// Our own macro is ours to replace.
+		{"pintail_authz", false},
+		// Anything else belongs to another tool or a hand-built deployment.
+		{"acme_authz", true},
+		{"authz_no", true},
+	}
+	for _, tc := range tests {
+		if got := hookIsForeign(tc.current); got != tc.want {
+			t.Errorf("hookIsForeign(%q) = %v, want %v", tc.current, got, tc.want)
+		}
+	}
+}
+
+func TestFirstStringValue(t *testing.T) {
+	tests := []struct {
+		name    string
+		in      string
+		column  string
+		want    string
+		wantErr bool
+	}{
+		{
+			name:   "reads the named column",
+			in:     `[{"value":"quack_nop_authorization"}]`,
+			column: "value",
+			want:   "quack_nop_authorization",
+		},
+		{
+			// The prologue-emits-output case: a quack_query script can print an
+			// array of its own ahead of the answer.
+			name:   "takes the last statement's array",
+			in:     "[{\"Success\":true}]\n[{\"value\":\"pintail_authz\"}]",
+			column: "value",
+			want:   "pintail_authz",
+		},
+		{"null becomes empty", `[{"value":null}]`, "value", "", false},
+		{"non-string is stringified", `[{"value":42}]`, "value", "42", false},
+		{"no rows is an error", `[]`, "value", "", true},
+		{"missing column is an error", `[{"other":1}]`, "value", "", true},
+		{"garbage is an error", `not json`, "value", "", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := firstStringValue([]byte(tc.in), tc.column)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, wantErr = %v", err, tc.wantErr)
+			}
+			if got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// onlineQuackClient is a client that reports itself online with a CLI present,
+// so a test about which keystrokes send what does not quietly skip on a machine
+// with no duckdb installed — the earlier guards in apply would short-circuit
+// before the behaviour under test.
+func onlineQuackClient(name string) *QuackClient {
+	c := NewQuackClient(ServerConfig{Name: name, Type: ConnQuack, Host: "h", Port: 9494}, nil, nil)
+	c.state = ConnState{Online: true}
+	c.hasCLI = true
+	c.cliPath = "/nonexistent/duckdb" // never executed: these tests assert on state, not results
+	return c
+}

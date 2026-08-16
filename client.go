@@ -998,6 +998,44 @@ func (c *QuackClient) runServerSQL(ctx context.Context, sql string) error {
 	return nil
 }
 
+// serverSetting reads one DuckDB setting from inside the Quack server process.
+//
+// It has to run there, not here: quack_authorization_function is SetScope::GLOBAL
+// on the server's database, and reading it through our own attached session would
+// report the CLI's own value instead of the server's.
+func (c *QuackClient) serverSetting(ctx context.Context, name string) (string, error) {
+	if !c.hasCLI {
+		return "", fmt.Errorf("duckdb CLI not found in PATH")
+	}
+	sql := fmt.Sprintf("SELECT current_setting('%s') AS value", sqlQuote(name))
+	out, err := c.serverInvocation(sql, "-json").command(ctx, c.cliPath).Output()
+	if err != nil {
+		return "", fmt.Errorf("%s", cliError(err))
+	}
+	return firstStringValue(out, "value")
+}
+
+// firstStringValue pulls one named column out of the first row of duckdb's
+// -json output.
+func firstStringValue(data []byte, column string) (string, error) {
+	data = lastJSONArray(bytes.TrimSpace(data))
+	var rows []map[string]interface{}
+	if err := json.Unmarshal(data, &rows); err != nil {
+		return "", fmt.Errorf("unexpected response: %s", strings.TrimSpace(string(data)))
+	}
+	if len(rows) == 0 {
+		return "", fmt.Errorf("no rows returned")
+	}
+	v, ok := rows[0][column]
+	if !ok {
+		return "", fmt.Errorf("response has no %q column", column)
+	}
+	if v == nil {
+		return "", nil
+	}
+	return fmt.Sprintf("%v", v), nil
+}
+
 // cliError prefers the subprocess's stderr over Go's bare "exit status 1",
 // which is what the fetch paths were surfacing (when they surfaced anything).
 func cliError(err error) string {

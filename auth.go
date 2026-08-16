@@ -37,6 +37,11 @@ type AuthEditor struct {
 	applyIsErr bool
 	applyTTL   int
 
+	// confirmApply is armed when an apply would install a policy that denies
+	// Pintail's own management statements, and requires a second [a] to go
+	// through.
+	confirmApply bool
+
 	// dirty records whether any permission has been toggled since the editor
 	// was opened, so the screen can say that edits are pending and the root
 	// model knows to write them back to the tokens.
@@ -191,7 +196,7 @@ func (a AuthEditor) Update(msg tea.Msg) (AuthEditor, tea.Cmd) {
 			if a.cursor >= len(a.policies) {
 				return a, nil
 			}
-			sql := a.applySQL(a.policies[a.cursor])
+			p := a.policies[a.cursor]
 			c := a.targetClient()
 			switch {
 			case c == nil:
@@ -200,10 +205,42 @@ func (a AuthEditor) Update(msg tea.Msg) (AuthEditor, tea.Cmd) {
 				a.setApplyMsg("duckdb CLI not found in PATH — SQL shown below to copy", true)
 			case !c.GetState().Online:
 				a.setApplyMsg(c.Config.Name+" is offline — SQL shown below to copy", true)
+			case policyLocksOutPintail(p) && !a.confirmApply:
+				// One more keystroke, deliberately. Every statement Pintail
+				// sends the server arrives as one string that the hook itself
+				// vets, and Pintail's management script begins with CREATE — so
+				// a policy that denies CREATE denies the next apply too. The
+				// server then cannot be edited from here at all.
+				a.confirmApply = true
+				a.setApplyMsg("this policy denies CREATE, so Pintail cannot change it again — press [a] to confirm, any other key to cancel", true)
 			default:
+				a.confirmApply = false
 				a.setApplyMsg("applying to "+c.Config.Name+"…", false)
-				return a, applyPolicyCmd(c, sql)
+				return a, applyPolicyCmd(c, a.applySQL(p))
 			}
+
+		// Restore the server's default allow-all callback. Worth a key of its
+		// own: after a policy that denies CREATE this is the only management
+		// statement that still gets through.
+		case "R":
+			c := a.targetClient()
+			switch {
+			case c == nil:
+				a.setApplyMsg("no Quack connection to reset", true)
+			case !c.HasCLI():
+				a.setApplyMsg("duckdb CLI not found in PATH", true)
+			case !c.GetState().Online:
+				a.setApplyMsg(c.Config.Name+" is offline", true)
+			default:
+				a.setApplyMsg("resetting "+c.Config.Name+" to "+authzDefault+"…", false)
+				return a, resetPolicyCmd(c)
+			}
+		}
+
+		// Any key other than a second [a] abandons a pending confirmation, so a
+		// stray keypress cannot leave the prompt armed.
+		if msg.String() != "a" {
+			a.confirmApply = false
 		}
 
 	// Result of an apply. This is a distinct message from the scratchpad's
@@ -211,13 +248,48 @@ func (a AuthEditor) Update(msg tea.Msg) (AuthEditor, tea.Cmd) {
 	// scratchpad, so this screen never reported success or failure and the
 	// scratchpad's own result was overwritten.
 	case authApplyResultMsg:
-		if msg.err != "" {
+		switch {
+		case msg.conflict != "":
+			a.setApplyMsg(fmt.Sprintf(
+				"%s already uses the hook %q — not overwriting it; press [R] to reset to %s first",
+				msg.target, msg.conflict, authzDefault), true)
+		case msg.err != "":
 			a.setApplyMsg("apply failed: "+firstLine(msg.err), true)
-		} else {
+		default:
 			a.setApplyMsg("applied to "+msg.target, false)
 		}
 	}
 	return a, nil
+}
+
+// hookIsForeign reports whether the hook currently installed on a server
+// belongs to somebody else, and so must not be overwritten by an apply.
+//
+// Quack's default is a named allow-all callback rather than an empty setting, so
+// authzDefault counts as "nothing installed" — treating only "" that way would
+// make every fresh server look occupied and block the first apply.
+func hookIsForeign(current string) bool {
+	switch current {
+	case "", authzDefault, authzMacroName:
+		return false
+	}
+	return true
+}
+
+// policyLocksOutPintail reports whether applying this policy would deny the
+// statements Pintail needs to manage the policy afterwards.
+//
+// Quack hands the authorization callback the whole query string, and Pintail's
+// management script is `CREATE OR REPLACE MACRO … ; SET GLOBAL …`, so the hook
+// sees a string beginning with CREATE. Deny CREATE and the next apply is
+// rejected by the policy currently in force — only RESET GLOBAL still works.
+func policyLocksOutPintail(p PolicyEntry) bool {
+	for _, perm := range p.Perms {
+		if perm.Op == "CREATE" && perm.Allowed {
+			return false
+		}
+	}
+	return true
 }
 
 // authApplyResultMsg carries the outcome of a policy apply back to this screen
@@ -225,7 +297,19 @@ func (a AuthEditor) Update(msg tea.Msg) (AuthEditor, tea.Cmd) {
 type authApplyResultMsg struct {
 	target string
 	err    string
+	// conflict names the hook already installed on the server when it is
+	// somebody else's. The apply is abandoned in that case rather than
+	// overwriting it.
+	conflict string
 }
+
+// authzSetting is the server setting that names the authorization callback.
+const authzSetting = "quack_authorization_function"
+
+// authzDefault is the value the setting holds when nobody has installed a hook.
+// Quack ships an allow-all callback rather than an empty setting, so "unset" is
+// this name and not "".
+const authzDefault = "quack_nop_authorization"
 
 // applyPolicyCmd installs the generated policy on the server.
 //
@@ -233,11 +317,44 @@ type authApplyResultMsg struct {
 // the authorization hook runs — so this goes through quack_query() rather than
 // our own attached session, which would have created the macro locally and left
 // the server's policy untouched.
+//
+// The setting is read first. Quack has exactly one authorization callback per
+// server, so applying a policy overwrites whatever was there — including a hook
+// some other tool or a hand-written deployment installed. Silently replacing
+// another system's access control is not ours to do, so a foreign hook aborts
+// the apply and is reported instead.
 func applyPolicyCmd(c *QuackClient, sql string) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
+
+		current, err := c.serverSetting(ctx, authzSetting)
+		if err != nil {
+			return authApplyResultMsg{target: c.Config.Name,
+				err: fmt.Sprintf("could not read %s: %s", authzSetting, err)}
+		}
+		if hookIsForeign(current) {
+			return authApplyResultMsg{target: c.Config.Name, conflict: current}
+		}
+
 		if err := c.runServerSQL(ctx, sql); err != nil {
+			return authApplyResultMsg{target: c.Config.Name, err: err.Error()}
+		}
+		return authApplyResultMsg{target: c.Config.Name}
+	}
+}
+
+// resetPolicyCmd restores the server's default allow-all callback.
+//
+// This is the documented way back: RESET GLOBAL returns the setting to
+// quack_nop_authorization. It matters because an applied policy that does not
+// permit CREATE denies Pintail's own management statements, and then this is the
+// last request Pintail can still make successfully.
+func resetPolicyCmd(c *QuackClient) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := c.runServerSQL(ctx, "RESET GLOBAL "+authzSetting); err != nil {
 			return authApplyResultMsg{target: c.Config.Name, err: err.Error()}
 		}
 		return authApplyResultMsg{target: c.Config.Name}
@@ -313,6 +430,15 @@ func (a AuthEditor) ViewPermGrid(width int) string {
 		"  "+mutedStyle.Render(p.TokenName),
 		"  "+mutedStyle.Render("scope: "+strings.Join(p.Scope, ", ")),
 		"",
+		// This belongs on the screen, not only in a comment inside the generated
+		// SQL further down. What the toggles compile to is a regexp over the
+		// statement text, and an admin reading a grid of SELECT/INSERT/DELETE
+		// checkboxes will otherwise reasonably assume real privilege enforcement.
+		"  "+amberStyle.Render("⚠ not a security boundary")+
+			mutedStyle.Render("  these toggles compile to a"),
+		"  "+mutedStyle.Render("statement-prefix match; WITH x AS (…) INSERT … passes as a read."),
+		"  "+mutedStyle.Render("Attach the database READ_ONLY for enforcement that holds."),
+		"",
 	)
 
 	for i, perm := range p.Perms {
@@ -356,6 +482,17 @@ func (a AuthEditor) ViewPermGrid(width int) string {
 		mutedStyle.Render("  Quack runs one authorization hook per server, so applying this"),
 		mutedStyle.Render("  sets the policy for every token — see the comments in the SQL."))
 
+	// A policy that denies CREATE denies Pintail's own management script, which
+	// the hook vets like any other query. Say so before [a], not after.
+	if policyLocksOutPintail(p) {
+		lines = append(lines,
+			"",
+			"  "+redStyle.Render("⚠ one-way: ")+
+				mutedStyle.Render("this denies CREATE, so Pintail cannot apply another"),
+			"  "+mutedStyle.Render("policy afterwards. Recovery is [R] (RESET GLOBAL) or local access"),
+			"  "+mutedStyle.Render("to the server process. Applying asks for confirmation."))
+	}
+
 	// Where an apply would go, so [a] is never a surprise.
 	target := mutedStyle.Render("  apply target  ") + redStyle.Render("none configured")
 	if c := a.targetClient(); c != nil {
@@ -398,6 +535,7 @@ func (a AuthEditor) ViewFooter() string {
 			keyBadge("↑↓") + " select perm",
 			keyBadge("space") + " toggle",
 			keyBadge("a") + " apply",
+			keyBadge("R") + " reset hook",
 			keyBadge("T") + " target",
 			keyBadge("tab") + " token list",
 			keyBadge("esc") + " save & back",
