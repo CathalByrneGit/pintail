@@ -440,7 +440,7 @@ func (m Model) selectedName() string {
 func (m *Model) selectConnection(idx int) {
 	if idx >= 0 && idx < len(m.configs) {
 		m.selected = idx
-		m.connTable.SetRows(connectionRows(m.data[idx].sessions))
+		m.connTable.SetRows(connectionRows(m.data[idx].sessions, m.connPanelWidth()))
 		m.connTable.GotoTop()
 	}
 }
@@ -539,7 +539,7 @@ func NewModelWithConfigs(configs []quack.ServerConfig, secrets []quack.StorageSe
 		snapshots:      NewSnapshotsView(clients),
 		logs:           NewLogsView(clients),
 	}
-	m.connTable = buildConnectionTable(nil)
+	m.connTable = buildConnectionTable(nil, 0)
 	return m
 }
 
@@ -553,19 +553,43 @@ func serverInfos(configs []quack.ServerConfig) []quack.ServerInfo {
 	return out
 }
 
-func buildConnectionTable(conns []quack.Connection) table.Model {
-	cols := []table.Column{
-		{Title: "ID", Width: 4},
-		{Title: "IP Address", Width: 15},
-		{Title: "Identity", Width: 16},
-		{Title: "Catalog", Width: 12},
-		{Title: "Duration", Width: 8},
-		{Title: "Queries", Width: 8},
-		{Title: "Status", Width: 10},
-	}
+// connColumns are the session table's columns with their preferred widths, and
+// the order in which they are given up when the panel is too narrow for all of
+// them. Least useful first: knowing a session is active matters more than
+// knowing its catalog.
+var connColumns = []struct {
+	title string
+	width int
+	// drop is the order this column is sacrificed in; 0 is never dropped.
+	drop int
+}{
+	{"ID", 4, 0},
+	{"IP Address", 15, 4},
+	{"Identity", 16, 3},
+	{"Catalog", 12, 5},
+	{"Duration", 8, 2},
+	{"Queries", 8, 1},
+	{"Status", 10, 0},
+}
+
+// tableCellPadding is what the bubbles table adds around each cell's content.
+const tableCellPadding = 2
+
+// buildConnectionTable sizes the session table to the width available.
+//
+// The columns used to be fixed, summing to 73 cells before the table's own
+// per-cell padding — about 87 in total, against a panel roughly 64 wide on a
+// 110-column terminal. The header and its rule wrapped inside the panel on any
+// ordinary terminal, which is what a hardcoded layout does the moment the box
+// around it is derived from the real width.
+//
+// width is the space available for the table. Zero or negative means "not laid
+// out yet", which gets the full set at their preferred widths.
+func buildConnectionTable(conns []quack.Connection, width int) table.Model {
+	cols := connectionColumns(width)
 	t := table.New(
 		table.WithColumns(cols),
-		table.WithRows(connectionRows(conns)),
+		table.WithRows(connectionRows(conns, width)),
 		table.WithFocused(true),
 		table.WithHeight(8),
 	)
@@ -579,6 +603,84 @@ func buildConnectionTable(conns []quack.Connection) table.Model {
 		Foreground(colorDarkBg).Background(colorDuckYellow).Bold(false)
 	t.SetStyles(s)
 	return t
+}
+
+// connectionColumns picks the widest set of columns that fits, dropping the
+// least useful ones first and then shrinking what remains.
+func columnsKept(width int) []bool {
+	keep := make([]bool, len(connColumns))
+	for i := range keep {
+		keep[i] = true
+	}
+	if width <= 0 {
+		return keep // not laid out yet: keep everything
+	}
+
+	total := func() int {
+		sum := 0
+		for i, c := range connColumns {
+			if keep[i] {
+				sum += c.width + tableCellPadding
+			}
+		}
+		return sum
+	}
+
+	// Drop in the declared order until it fits, never dropping the two columns
+	// that identify a row and its state.
+	for order := 1; total() > width; order++ {
+		dropped := false
+		for i, c := range connColumns {
+			if c.drop == order && keep[i] {
+				keep[i] = false
+				dropped = true
+			}
+		}
+		if !dropped {
+			break // nothing left that may be dropped
+		}
+	}
+	return keep
+}
+
+func connectionColumns(width int) []table.Column {
+	keep := columnsKept(width)
+
+	total := func() int {
+		sum := 0
+		for i, c := range connColumns {
+			if keep[i] {
+				sum += c.width + tableCellPadding
+			}
+		}
+		return sum
+	}
+
+	var cols []table.Column
+	for i, c := range connColumns {
+		if keep[i] {
+			cols = append(cols, table.Column{Title: c.title, Width: c.width})
+		}
+	}
+
+	// Still too wide with the minimum set — shrink the remaining columns
+	// proportionally rather than letting the panel wrap.
+	if width > 0 {
+		if over := total() - width; over > 0 {
+			for i := range cols {
+				share := over / len(cols)
+				if i == 0 {
+					share += over % len(cols)
+				}
+				if cols[i].Width-share < 3 {
+					cols[i].Width = 3
+				} else {
+					cols[i].Width -= share
+				}
+			}
+		}
+	}
+	return cols
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────
@@ -607,6 +709,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			tableH = 2
 		}
 		m.connTable.SetHeight(tableH)
+		// Rebuild the columns for the new width: the table does not reflow on
+		// its own, so without this the panel keeps whatever layout it was born
+		// with regardless of the terminal it ends up in.
+		m.connTable.SetColumns(connectionColumns(m.connPanelWidth()))
+		if d, ok := m.selectedData(); ok {
+			// Rows carry one cell per column, so they have to be rebuilt with
+			// the columns — a longer row makes the bubbles table panic.
+			m.connTable.SetRows(connectionRows(d.sessions, m.connPanelWidth()))
+		}
 		m.scratchpad.Resize(m.width, m.height)
 
 	// ── ping result: detect offline→online transition ─────────────────────
@@ -664,7 +775,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		d.reportedCount = msg.reportedCount
 		d.sessions = msg.connections
 		if msg.idx == m.selected {
-			m.connTable.SetRows(connectionRows(d.sessions))
+			m.connTable.SetRows(connectionRows(d.sessions, m.connPanelWidth()))
 		}
 		return m, nil
 
@@ -1334,6 +1445,22 @@ func (m Model) viewHeader() string {
 	return lipgloss.JoinVertical(lipgloss.Left, titleBar, serverRow, divider)
 }
 
+// connPanelWidth is the space the session table has inside the connections
+// panel: the panel takes 60% of the terminal, and the style subtracts two cells
+// for the border plus its own padding.
+//
+// It exists so the resize handler and the panel agree on one number. They did
+// not before — the table was built with fixed widths and the panel with a
+// derived one, so the table overflowed its own box.
+func (m Model) connPanelWidth() int {
+	leftW := (m.width * 60) / 100
+	inner := leftW - 2 - panelStyle.GetHorizontalPadding() - panelStyle.GetHorizontalBorderSize()
+	if inner < 0 {
+		return 0
+	}
+	return inner
+}
+
 func (m Model) viewConnectionsPanel(width, height int) string {
 	d, have := m.selectedData()
 
@@ -1383,11 +1510,15 @@ func (m Model) viewCatalogPanel(width, height int) string {
 				mutedStyle.Render("  "+truncate(firstLine(d.catalogErr), width-6)),
 			)
 		} else {
+			// Split across lines rather than relying on the panel to wrap: at
+			// 110 columns the single-line version wrapped and the continuation
+			// came back unindented, which reads as a layout fault.
 			lines = append(lines,
 				mutedStyle.Render("  ◌ no catalog data"),
 				"",
-				mutedStyle.Render("  populates from duckdb_tables() / duckdb_views()"),
-				mutedStyle.Render("  when a connection comes online"),
+				mutedStyle.Render("  populates from duckdb_tables()"),
+				mutedStyle.Render("  and duckdb_views() once a"),
+				mutedStyle.Render("  connection comes online"),
 				"",
 				mutedStyle.Render("  see README §Getting started"),
 			)
@@ -1883,14 +2014,27 @@ func (m Model) viewScratchpadScreen() string {
 
 // ── format helpers ────────────────────────────────────────────────────────
 
-func connectionRows(conns []quack.Connection) []table.Row {
+// connectionRows renders the sessions as table rows.
+//
+// width must match what was passed to connectionColumns, because the cells are
+// selected by the same rule: the bubbles table indexes each row per column and
+// panics outright on a row with more cells than there are columns.
+func connectionRows(conns []quack.Connection, width int) []table.Row {
+	keep := columnsKept(width)
 	rows := make([]table.Row, len(conns))
 	for i, c := range conns {
-		rows[i] = table.Row{
+		all := []string{
 			c.ID, c.IP, c.Identity, c.Catalog,
 			fmtDuration(c.Duration), fmt.Sprintf("%d", c.Queries),
 			statusGlyph(c.Status) + c.Status,
 		}
+		row := make(table.Row, 0, len(all))
+		for j, cell := range all {
+			if keep[j] {
+				row = append(row, cell)
+			}
+		}
+		rows[i] = row
 	}
 	return rows
 }

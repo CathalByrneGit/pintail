@@ -175,7 +175,7 @@ func TestLogsScreenRendersAtAnySize(t *testing.T) {
 		data:        make([]connData, 1),
 		currentView: viewLogs,
 	}
-	m.connTable = buildConnectionTable(nil)
+	m.connTable = buildConnectionTable(nil, 0)
 	m.logs = NewLogsView(m.clients)
 	m.logs.entries = entries
 

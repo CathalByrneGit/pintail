@@ -293,8 +293,10 @@ func (tm TokenManager) ViewTokenList(width, height int) string {
 
 	for i, t := range tm.tokens {
 		cursor := "  "
-		style := mutedStyle
-		dot := mutedStyle.Render("●")
+		// Both assigned in every branch below; declared without a value so a
+		// missed branch is a compile error rather than a silent muted row.
+		var style lipgloss.Style
+		var dot string
 
 		if t.Active {
 			dot = greenStyle.Render("●")

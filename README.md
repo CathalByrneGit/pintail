@@ -427,23 +427,31 @@ verified against:
 | Component | Version | How |
 |-----------|---------|-----|
 | DuckDB CLI | `v1.5.5` (Variegata) | Queries run against a real binary — the integration tests do this in CI |
-| `duckdb-quack` | `main` @ `7e80f7f` (2026-07-20) | Extension sources read for the wire protocol, ATTACH options, SSL defaults, and `quack_active_connections()` |
-| `ducklake` | `main` @ `3d8e24a` (2026-08-13) | Sources read for `snapshots()`, `AT (VERSION => …)` and `ducklake_expire_snapshots` |
+| `quack` extension | installed for the pinned DuckDB | **CI starts a real server** with `quack_serve` and runs Pintail's own client against it |
+| `duckdb-quack` | `main` @ `7e80f7f` (2026-07-20) | Extension sources and its own test suite read for the wire protocol, ATTACH options, SSL defaults, and `quack_active_connections()` |
+| `ducklake` | `main` @ `3d8e24a` (2026-08-13) | Sources read for `snapshots()`, `AT (VERSION => …)` and `ducklake_expire_snapshots`; the snapshot listing is executed against a real lake in CI |
 | Quack docs | `docs/current/quack/*` | Overview, reference, security, and the reverse-proxy guide |
 
 What that means concretely:
 
+- **Executed against a live Quack server** (the `live-quack` CI job): the
+  `ATTACH … (TOKEN …, DISABLE_SSL …)` form, query execution and error
+  reporting through it, the catalog listing, `quack_active_connections()` via
+  `quack_query`, `enable_logging` plus the columns of
+  `duckdb_logs_parsed('Quack')`, the authorization hook's read-back / install /
+  `RESET GLOBAL` cycle, and rejection of a wrong token. CI fails if any of
+  these silently skip, so "passing" cannot mean "tested nothing".
 - **Executed against DuckDB 1.5.5**: the catalog query (`duckdb_tables()` /
-  `duckdb_views()`), the session-facts query, `enable_logging` /
-  `duckdb_logs_parsed`, and the scratchpad's own error and cancellation paths.
-  These are covered by tests that skip when `duckdb` is absent.
-- **Read from sources or docs, not executed**: everything that needs a running
-  Quack server or the `ducklake` extension — the `ATTACH … (TOKEN …,
-  DISABLE_SSL …)` form, `quack_query`, `quack_active_connections()`, the
-  authorization hook, and the DuckLake snapshot SQL. The extension host is
-  unreachable from the environment this was developed in, so these match the
-  published sources and docs but have not been round-tripped against a live
-  server.
+  `duckdb_views()`), the session-facts query, DuckLake snapshot listing and
+  time-travel SQL, Parquet export, and the scratchpad's own error and
+  cancellation paths.
+- **Read from sources or docs, not executed**: the reverse-proxy configs (they
+  describe Caddy/Nginx/Envoy, not DuckDB), and the per-token scoping caveats
+  around the authorization hook, which is per-server by design.
+
+The authorization screen's toggles compile to a statement-prefix regexp, which
+is **not** a security boundary — `WITH x AS (…) INSERT …` passes as a read. The
+screen says so, and DuckLake or a read-only ATTACH is the real mechanism.
 
 If you run Pintail against a newer Quack than the above and something breaks,
 the generated SQL in each screen is visible on screen for exactly that reason:

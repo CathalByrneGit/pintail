@@ -66,7 +66,7 @@ func populatedModel(t *testing.T) Model {
 		height:      40,
 	}
 	m.data = make([]connData, len(cfgs))
-	m.connTable = buildConnectionTable(nil)
+	m.connTable = buildConnectionTable(nil, 0)
 	m.tokenMgr = TokenManager{tokens: tokens, secrets: secrets}
 	m.tlsGen = NewTLSGenerator(cfgs)
 	m.authEditor = NewAuthEditor(tokens, m.clients)
@@ -235,6 +235,83 @@ func TestPanelsSurviveNegativeWidths(t *testing.T) {
 				}()
 				_ = render(w)
 			}()
+		}
+	}
+}
+
+// The session table used to be built with fixed column widths summing to about
+// 87 cells including the table's own padding, against a panel roughly 64 wide on
+// a 110-column terminal — so its header and rule wrapped inside the panel on any
+// ordinary size. Columns are now chosen to fit.
+func TestConnectionTableFitsItsPanel(t *testing.T) {
+	for _, total := range []int{60, 80, 100, 110, 120, 160, 200, 300} {
+		m := populatedModel(t)
+		m.width, m.height = total, 40
+		avail := m.connPanelWidth()
+
+		cols := connectionColumns(avail)
+		if len(cols) == 0 {
+			t.Errorf("width %d: no columns at all", total)
+			continue
+		}
+
+		sum := 0
+		for _, c := range cols {
+			sum += c.Width + tableCellPadding
+		}
+		if sum > avail {
+			t.Errorf("terminal %d (panel %d): columns total %d cells, overflowing by %d: %v",
+				total, avail, sum, sum-avail, cols)
+		}
+
+		// The two columns that identify a row and its state are never dropped —
+		// a table of durations with no id is useless.
+		var titles []string
+		for _, c := range cols {
+			titles = append(titles, c.Title)
+		}
+		for _, required := range []string{"ID", "Status"} {
+			found := false
+			for _, got := range titles {
+				if got == required {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("terminal %d: %q was dropped; columns are %v", total, required, titles)
+			}
+		}
+	}
+
+	// A wide terminal keeps the full set.
+	wide := connectionColumns(200)
+	if len(wide) != len(connColumns) {
+		t.Errorf("a 200-cell panel should keep every column, got %d of %d", len(wide), len(connColumns))
+	}
+
+	// Not laid out yet: the full set at preferred widths, rather than nothing.
+	if got := connectionColumns(0); len(got) != len(connColumns) {
+		t.Errorf("width 0 should give the full set, got %d columns", len(got))
+	}
+}
+
+// The panel renders the table, so no line inside it may exceed the panel either
+// — the check above is on the arithmetic, this one on the result.
+func TestConnectionsPanelDoesNotWrapInternally(t *testing.T) {
+	for _, total := range []int{80, 100, 110, 120, 160} {
+		m := populatedModel(t)
+		m.width, m.height = total, 40
+		m.connTable.SetColumns(connectionColumns(m.connPanelWidth()))
+		m.connTable.SetRows(connectionRows(m.data[0].sessions, m.connPanelWidth()))
+
+		leftW := (total * 60) / 100
+		out := m.viewConnectionsPanel(leftW, 20)
+		for i, line := range strings.Split(out, "\n") {
+			if got := ansi.StringWidth(line); got > leftW {
+				t.Errorf("terminal %d: panel line %d is %d cells, wider than the %d-cell panel:\n%q",
+					total, i+1, got, leftW, line)
+				break
+			}
 		}
 	}
 }

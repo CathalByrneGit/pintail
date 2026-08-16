@@ -63,7 +63,7 @@ func TestRootModelRoutesCtrlCWhileQuerying(t *testing.T) {
 		width:       100,
 		height:      40,
 	}
-	m.connTable = buildConnectionTable(nil)
+	m.connTable = buildConnectionTable(nil, 0)
 	m.scratchpad = NewScratchpad([]quack.ServerInfo{cfg.ToServerInfo()}, []*quack.QuackClient{c})
 	m.scratchpad.Resize(100, 40)
 

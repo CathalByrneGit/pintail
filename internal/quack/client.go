@@ -1444,3 +1444,13 @@ func (c *QuackClient) CopyToParquet(ctx context.Context, sql, path string) error
 	}
 	return nil
 }
+
+// AuthzSetting is the server setting that names Quack's authorization callback.
+const AuthzSetting = "quack_authorization_function"
+
+// AuthzDefault is the value that setting holds when nobody has installed a hook.
+//
+// Quack ships a named allow-all callback rather than leaving the setting empty,
+// so "nothing installed" is this string and not "". Reading it as "" would make
+// every fresh server look like it already had a policy.
+const AuthzDefault = "quack_nop_authorization"

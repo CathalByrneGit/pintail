@@ -280,12 +280,12 @@ func TestAuthEditorRefusesToOverwriteAForeignHook(t *testing.T) {
 // "" as the only unset value would make every fresh server look like it already
 // had a policy and block the first apply.
 func TestAuthzDefaultIsNotEmpty(t *testing.T) {
-	if authzDefault != "quack_nop_authorization" {
-		t.Errorf("authzDefault = %q; Quack ships quack_nop_authorization as the default hook",
-			authzDefault)
+	if quack.AuthzDefault != "quack_nop_authorization" {
+		t.Errorf("quack.AuthzDefault = %q; Quack ships quack_nop_authorization as the default hook",
+			quack.AuthzDefault)
 	}
-	if authzSetting != "quack_authorization_function" {
-		t.Errorf("authzSetting = %q, want quack_authorization_function", authzSetting)
+	if quack.AuthzSetting != "quack_authorization_function" {
+		t.Errorf("quack.AuthzSetting = %q, want quack_authorization_function", quack.AuthzSetting)
 	}
 }
 
@@ -391,7 +391,7 @@ func TestResetHookIsAvailable(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("[R] should issue a reset")
 	}
-	if !strings.Contains(a.applyMsg, authzDefault) {
+	if !strings.Contains(a.applyMsg, quack.AuthzDefault) {
 		t.Errorf("applyMsg = %q, want it to name the default hook", a.applyMsg)
 	}
 }

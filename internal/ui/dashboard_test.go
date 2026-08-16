@@ -27,7 +27,7 @@ func threeConnModel(t *testing.T) Model {
 		width:       120,
 		height:      40,
 	}
-	m.connTable = buildConnectionTable(nil)
+	m.connTable = buildConnectionTable(nil, 0)
 	return m
 }
 

@@ -237,30 +237,30 @@ func (sp Scratchpad) Update(msg tea.Msg) (Scratchpad, tea.Cmd) {
 			// Call viewport's page-up method directly. The bubbles viewport
 			// default keymap doesn't bind ctrl+b/ctrl+f, so forwarding the
 			// raw msg to viewport.Update was silently doing nothing for them.
-			sp.resultsVP.ViewUp()
+			sp.resultsVP.PageUp()
 			return sp, nil
 
 		case "pgdown", "ctrl+f":
-			sp.resultsVP.ViewDown()
+			sp.resultsVP.PageDown()
 			return sp, nil
 
 		case "ctrl+u":
 			// half-page up (vim/less convention)
-			sp.resultsVP.HalfViewUp()
+			sp.resultsVP.HalfPageUp()
 			return sp, nil
 
 		case "ctrl+d":
 			// half-page down
-			sp.resultsVP.HalfViewDown()
+			sp.resultsVP.HalfPageDown()
 			return sp, nil
 
 		case "alt+up":
 			// single-line scroll up — works on every keyboard, no Fn dance
-			sp.resultsVP.LineUp(1)
+			sp.resultsVP.ScrollUp(1)
 			return sp, nil
 
 		case "alt+down":
-			sp.resultsVP.LineDown(1)
+			sp.resultsVP.ScrollDown(1)
 			return sp, nil
 
 		case "home":
@@ -736,7 +736,7 @@ func exportParquet(c *quack.QuackClient, sql string) (string, error) {
 	if c == nil || !c.HasCLI() {
 		return "", fmt.Errorf("duckdb CLI not available")
 	}
-	if c.GetState().Online == false {
+	if !c.GetState().Online {
 		return "", fmt.Errorf("connection offline")
 	}
 	path, err := exportPath("parquet")

@@ -182,7 +182,7 @@ func TestSaveRefusedShowsWhy(t *testing.T) {
 		width:       120,
 		height:      40,
 	}
-	m.connTable = buildConnectionTable(nil)
+	m.connTable = buildConnectionTable(nil, 0)
 	m.scratchpad = NewScratchpad(nil, nil)
 
 	// Try to save a second connection with a name that is already taken.

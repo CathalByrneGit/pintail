@@ -234,7 +234,7 @@ func (a AuthEditor) Update(msg tea.Msg) (AuthEditor, tea.Cmd) {
 			case !c.GetState().Online:
 				a.setApplyMsg(c.Config.Name+" is offline", true)
 			default:
-				a.setApplyMsg("resetting "+c.Config.Name+" to "+authzDefault+"…", false)
+				a.setApplyMsg("resetting "+c.Config.Name+" to "+quack.AuthzDefault+"…", false)
 				return a, resetPolicyCmd(c)
 			}
 		}
@@ -254,7 +254,7 @@ func (a AuthEditor) Update(msg tea.Msg) (AuthEditor, tea.Cmd) {
 		case msg.conflict != "":
 			a.setApplyMsg(fmt.Sprintf(
 				"%s already uses the hook %q — not overwriting it; press [R] to reset to %s first",
-				msg.target, msg.conflict, authzDefault), true)
+				msg.target, msg.conflict, quack.AuthzDefault), true)
 		case msg.err != "":
 			a.setApplyMsg("apply failed: "+firstLine(msg.err), true)
 		default:
@@ -268,11 +268,11 @@ func (a AuthEditor) Update(msg tea.Msg) (AuthEditor, tea.Cmd) {
 // belongs to somebody else, and so must not be overwritten by an apply.
 //
 // Quack's default is a named allow-all callback rather than an empty setting, so
-// authzDefault counts as "nothing installed" — treating only "" that way would
+// quack.AuthzDefault counts as "nothing installed" — treating only "" that way would
 // make every fresh server look occupied and block the first apply.
 func hookIsForeign(current string) bool {
 	switch current {
-	case "", authzDefault, authzMacroName:
+	case "", quack.AuthzDefault, authzMacroName:
 		return false
 	}
 	return true
@@ -305,14 +305,6 @@ type authApplyResultMsg struct {
 	conflict string
 }
 
-// authzSetting is the server setting that names the authorization callback.
-const authzSetting = "quack_authorization_function"
-
-// authzDefault is the value the setting holds when nobody has installed a hook.
-// Quack ships an allow-all callback rather than an empty setting, so "unset" is
-// this name and not "".
-const authzDefault = "quack_nop_authorization"
-
 // applyPolicyCmd installs the generated policy on the server.
 //
 // The macro and the setting have to exist in the server process — that is where
@@ -330,10 +322,10 @@ func applyPolicyCmd(c *quack.QuackClient, sql string) tea.Cmd {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 
-		current, err := c.ServerSetting(ctx, authzSetting)
+		current, err := c.ServerSetting(ctx, quack.AuthzSetting)
 		if err != nil {
 			return authApplyResultMsg{target: c.Config.Name,
-				err: fmt.Sprintf("could not read %s: %s", authzSetting, err)}
+				err: fmt.Sprintf("could not read %s: %s", quack.AuthzSetting, err)}
 		}
 		if hookIsForeign(current) {
 			return authApplyResultMsg{target: c.Config.Name, conflict: current}
@@ -356,7 +348,7 @@ func resetPolicyCmd(c *quack.QuackClient) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		if err := c.RunServerSQL(ctx, "RESET GLOBAL "+authzSetting); err != nil {
+		if err := c.RunServerSQL(ctx, "RESET GLOBAL "+quack.AuthzSetting); err != nil {
 			return authApplyResultMsg{target: c.Config.Name, err: err.Error()}
 		}
 		return authApplyResultMsg{target: c.Config.Name}

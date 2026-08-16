@@ -46,8 +46,6 @@ type LogsView struct {
 	// server state and so is never done implicitly by a poll.
 	notice    string
 	noticeErr bool
-
-	width int
 }
 
 // ── constructor ───────────────────────────────────────────────────────────
