@@ -188,12 +188,26 @@ fetches for minutes.
 The **Auth policy** screen (`p`) generates Quack's authorization hook — a
 `(connection_id, query) → BOOLEAN` macro plus
 `SET GLOBAL quack_authorization_function` — from the permission toggles, and
-applies it on the server via `quack_query`. Two limits the screen states rather
-than hides: the hook is **per server, not per token** (scoping to one token
-needs an authentication hook recording `connection_id` → user), and prefix
-matching over statement text is not airtight — `WITH x AS (…) INSERT …` begins
-with `WITH` yet still writes. For real read-only enforcement, attach read-only
-or inspect the parsed statement type. See the
+applies it on the server via `quack_query`. Three limits the screen states
+rather than hides:
+
+- The hook is **per server, not per token**. Scoping to one token needs an
+  authentication hook recording `connection_id` → user, looked up via the
+  callback's `sid` argument.
+- Prefix matching over statement text **is not a security boundary**.
+  `WITH x AS (…) INSERT …` begins with `WITH` yet still writes. For enforcement
+  that holds, attach the database read-only.
+- Applying a policy that denies `CREATE` is **effectively one-way**. Quack hands
+  the callback the whole query string, and Pintail's own management script
+  begins with `CREATE OR REPLACE MACRO`, so the policy in force rejects the next
+  apply. `R` runs the `RESET GLOBAL` that still gets through; the only other way
+  back is local access to the server process. Applying such a policy asks for
+  confirmation first.
+
+Pintail also reads `quack_authorization_function` before writing it, and
+**refuses to overwrite a hook it did not install** — another tool's access
+control is not ours to replace. Note that Quack's default is a named allow-all
+callback (`quack_nop_authorization`), not an empty setting. See the
 [Quack security docs](https://duckdb.org/docs/current/quack/security).
 
 ### Bootstrapping the config file directly
@@ -571,7 +585,7 @@ Other files written under `~/.duckdb/`:
 
 **TLS config:** `↑↓` field · `tab` proxy type · `pgup`/`pgdn` scroll · `ctrl+s` save · `esc` back
 
-**Auth policy:** `↑↓` select · `tab` switch panel · `space` toggle · `a` apply · `T` cycle apply target · `esc` save & back
+**Auth policy:** `↑↓` select · `tab` switch panel · `space` toggle · `a` apply (twice, for a policy that denies `CREATE`) · `R` reset the server's hook to the default · `T` cycle apply target · `esc` save & back
 
 **Connections (`a`):** `↑↓`/`tab` field · `←→`/`space` cycle type · `enter` advance/save · `esc` cancel; on the list panel: `e` edit · `d` delete · `→` back to form
 
