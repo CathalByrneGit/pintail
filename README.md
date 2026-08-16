@@ -451,7 +451,7 @@ copy it, adjust it, and open an issue.
 
 ## Building
 
-Requires Go 1.22+.
+Requires Go 1.24.2+ (the floor the Bubble Tea v1 line sets).
 
 ```bash
 git clone https://github.com/CathalByrneGit/pintail
