@@ -230,6 +230,17 @@ jobs:
           done
           echo "all live-server tests ran"
 
-      - name: Server log
-        if: always()
-        run: cat /tmp/quack/server.log || true
+      # The server's own Quack log, trimmed. Untrimmed and unconditional it was
+      # tens of lines of DEBUG at the end of every job, which buried the test
+      # output that explains the failure.
+      - name: Server log (tail)
+        if: failure()
+        run: tail -25 /tmp/quack/server.log || true
+
+      # Printed last so the end of the job log is the reason it failed, rather
+      # than whatever the server happened to log afterwards.
+      - name: Which live tests failed
+        if: failure()
+        run: |
+          echo "--- live test results ---"
+          grep -E '^(=== RUN|--- (PASS|FAIL|SKIP)|    live_test)' live.txt || cat live.txt
