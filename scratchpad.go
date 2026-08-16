@@ -5,7 +5,6 @@ import (
 	"encoding/csv"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -767,7 +766,7 @@ func exportParquet(c *QuackClient, sql string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, c.cliPath, c.cliArgs(copySQL)...)
+	cmd := c.invocation(copySQL).command(ctx, c.cliPath)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return "", fmt.Errorf("%s", strings.TrimSpace(string(out)))
 	}

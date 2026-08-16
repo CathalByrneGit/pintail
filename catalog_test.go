@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -188,6 +189,63 @@ func TestMetadataQueriesAgainstRealDuckDB(t *testing.T) {
 			t.Errorf("first row = %v, want id 0", msg.result.Rows[0])
 		}
 	})
+
+	// -bail: a script on stdin does not abort on error the way `duckdb -c` does.
+	// Without it, a failing prologue statement is reported and then the caller's
+	// query runs anyway — against whatever catalog happened to be current.
+	t.Run("a failing statement stops the script", func(t *testing.T) {
+		_, err := c.queryCLI(context.Background(),
+			"SELECT * FROM does_not_exist; SELECT 42 AS answer;")
+		if err == nil {
+			t.Fatal("want an error; the script should have stopped at the bad statement")
+		}
+		if strings.Contains(err.Error(), "42") {
+			t.Errorf("the second statement ran after the failure: %v", err)
+		}
+	})
+}
+
+// -no-init: without it the operator's ~/.duckdbrc executes ahead of Pintail's
+// prologue. A .duckdbrc only has to attach a database under one of Pintail's
+// own aliases to break every query on the connection, and its output lands on
+// stdout in the middle of the JSON being parsed.
+func TestInitFileIsIgnoredAgainstRealDuckDB(t *testing.T) {
+	if _, err := exec.LookPath("duckdb"); err != nil {
+		t.Skip("duckdb not in PATH — skipping integration test")
+	}
+
+	home := t.TempDir()
+	// The collision that matters: _lake is the alias Pintail's own DuckLake
+	// prologue attaches, so this rc file makes every DuckLake query fail with
+	// `database with name "_lake" already exists`.
+	rc := "ATTACH ':memory:' AS _lake;\nSELECT 'init ran' AS note;\n"
+	if err := os.WriteFile(filepath.Join(home, ".duckdbrc"), []byte(rc), 0o600); err != nil {
+		t.Fatalf("writing .duckdbrc: %v", err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home) // windows
+
+	dbPath := filepath.Join(t.TempDir(), "fixture.duckdb")
+	// -no-init here too: seeding must not trip over the rc file we just wrote.
+	if out, err := exec.Command("duckdb", "-no-init", dbPath, "-c", "CREATE TABLE t(a int);").CombinedOutput(); err != nil {
+		t.Fatalf("seeding fixture: %v\n%s", err, out)
+	}
+
+	c := NewQuackClient(ServerConfig{Name: "fixture", Type: ConnLocal, Path: dbPath}, nil, nil)
+	if _, err := c.Ping(context.Background()); err != nil {
+		t.Fatalf("ping: %v", err)
+	}
+
+	r, err := c.queryCLI(context.Background(), "ATTACH ':memory:' AS _lake; SELECT 42 AS answer;")
+	if err != nil {
+		t.Fatalf("the init file was not skipped: %v", err)
+	}
+	if len(r.Rows) != 1 || len(r.Columns) != 1 || r.Columns[0] != "answer" {
+		t.Fatalf("got columns %v rows %v, want only the query's own result", r.Columns, r.Rows)
+	}
+	if r.Rows[0][0] != "42" {
+		t.Errorf("row = %v, want 42", r.Rows[0])
+	}
 }
 
 // `duckdb -json -c` prints one JSON array per statement that produces a result,

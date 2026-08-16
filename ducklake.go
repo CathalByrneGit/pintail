@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os/exec"
 	"strings"
 	"time"
 
@@ -304,10 +303,12 @@ func fetchSnapshots(ctx context.Context, c *QuackClient) ([]Snapshot, error) {
 	// default schema; it expands to ducklake_snapshots('_lake'), so both
 	// spellings are valid once attachPrefix() has run ATTACH ... AS _lake.
 	sql := "SELECT * FROM _lake.snapshots() ORDER BY snapshot_id DESC LIMIT 50;"
-	cmd := exec.CommandContext(ctx, c.cliPath, c.cliArgs(sql, "-json")...)
-	out, err := cmd.CombinedOutput()
+	// Output, not CombinedOutput: on success this output is parsed as JSON, and
+	// folding stderr into it would let any duckdb warning corrupt the parse.
+	// cliError still recovers stderr on failure, which is where it belongs.
+	out, err := c.invocation(sql, "-json").command(ctx, c.cliPath).Output()
 	if err != nil {
-		return nil, fmt.Errorf("snapshot query failed: %s", strings.TrimSpace(string(out)))
+		return nil, fmt.Errorf("snapshot query failed: %s", cliError(err))
 	}
 	return parseSnapshotRows(out)
 }

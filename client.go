@@ -737,7 +737,34 @@ func ctxReason(ctx context.Context) string {
 	return ""
 }
 
-// cliArgs builds the duckdb argv for a script.
+// cliInvocation is everything needed to run one duckdb subprocess: the argv and
+// the script that goes in on stdin.
+//
+// They travel together in one value on purpose. The script is the part that
+// carries credentials — TOKEN '…' for a Quack server, KEY_ID/SECRET for a
+// storage secret — and argv is the part the whole machine can read out of
+// /proc/<pid>/cmdline. Keeping the split in a type makes "no credential ever
+// reaches argv" a property a test can assert, rather than a convention each of
+// the seven call sites has to remember.
+type cliInvocation struct {
+	Args   []string // argv after the binary name; never contains user SQL or secrets
+	Script string   // fed to the process on stdin
+}
+
+// baseCLIFlags are passed to every duckdb invocation Pintail makes.
+//
+// -no-init skips the operator's ~/.duckdbrc. That file otherwise runs before
+// our prologue, and it only has to contain `ATTACH ':memory:' AS _lake` to make
+// every DuckLake query fail with `database with name "_lake" already exists`.
+// Its output is also written to stdout, in the middle of the JSON we parse.
+//
+// -bail stops at the first failing statement. `duckdb -c` aborts on error by
+// default but a script on stdin does not: it reports the error and carries on
+// to the next statement, so without -bail a failed ATTACH would be followed by
+// the caller's query running against whatever catalog happened to be current.
+var baseCLIFlags = []string{"-no-init", "-bail"}
+
+// invocation builds the duckdb subprocess for a script against this connection.
 //
 // A local file on disk is opened positionally; everything else is reached with
 // the ATTACH + USE prologue so unqualified table names resolve. The prologue is
@@ -745,19 +772,36 @@ func ctxReason(ctx context.Context) string {
 // file, but carries the CREATE SECRET when the connection references a storage
 // secret. Local connections previously skipped it entirely, so the documented
 // combination of a local path plus storage_secret_ref silently did nothing.
-func (c *QuackClient) cliArgs(sql string, flags ...string) []string {
-	args := make([]string, 0, len(flags)+3)
+func (c *QuackClient) invocation(sql string, flags ...string) cliInvocation {
+	args := make([]string, 0, len(flags)+len(baseCLIFlags)+1)
 	if c.Config.Type == ConnLocal && !c.Config.LocalIsRemote() {
 		args = append(args, c.Config.Path)
 	}
+	args = append(args, baseCLIFlags...)
 	args = append(args, flags...)
-	return append(args, "-c", c.attachPrefix()+sql)
+	return cliInvocation{Args: args, Script: c.attachPrefix() + sql}
 }
 
-// queryCLI shells out to the duckdb binary with the argv from cliArgs.
+// serverInvocation builds a subprocess that runs sql *inside* the Quack server
+// via quack_query, deliberately without our own ATTACH prologue.
+func (c *QuackClient) serverInvocation(sql string, flags ...string) cliInvocation {
+	args := make([]string, 0, len(flags)+len(baseCLIFlags))
+	args = append(args, baseCLIFlags...)
+	args = append(args, flags...)
+	return cliInvocation{Args: args, Script: c.Config.quackQuerySQL(sql)}
+}
+
+// command turns an invocation into a runnable subprocess with the script wired
+// to stdin. Every duckdb call in Pintail goes through here.
+func (inv cliInvocation) command(ctx context.Context, bin string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, bin, inv.Args...)
+	cmd.Stdin = strings.NewReader(inv.Script)
+	return cmd
+}
+
+// queryCLI shells out to the duckdb binary for a user query.
 func (c *QuackClient) queryCLI(ctx context.Context, sql string) (*QueryResult, error) {
-	cmd := exec.CommandContext(ctx, c.cliPath, c.cliArgs(sql, "-json")...)
-	out, err := cmd.Output()
+	out, err := c.invocation(sql, "-json").command(ctx, c.cliPath).Output()
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok && len(ee.Stderr) > 0 {
 			return nil, fmt.Errorf("%s", strings.TrimSpace(string(ee.Stderr)))
@@ -926,11 +970,10 @@ func (c *QuackClient) FetchSessionsCmd(idx int) tea.Cmd {
 // current_connection_id() and duckdb_connection_count() — honest about what it
 // was, but describing the wrong process.
 func (c *QuackClient) fetchQuackSessions(ctx context.Context, idx int) tea.Msg {
-	// Deliberately not via cliArgs: quack_query connects to the server itself,
-	// so this must not be preceded by the ATTACH prologue.
-	sql := c.Config.quackQuerySQL("FROM quack_active_connections()")
-	cmd := exec.CommandContext(ctx, c.cliPath, "-json", "-c", sql)
-	out, err := cmd.Output()
+	// serverInvocation, not invocation: quack_query connects to the server
+	// itself, so this must not be preceded by the ATTACH prologue.
+	out, err := c.serverInvocation("FROM quack_active_connections()", "-json").
+		command(ctx, c.cliPath).Output()
 	if err != nil {
 		return sessionResultMsg{idx: idx, err: fmt.Errorf("session query: %s", cliError(err))}
 	}
@@ -945,7 +988,7 @@ func (c *QuackClient) runServerSQL(ctx context.Context, sql string) error {
 	if !c.hasCLI {
 		return fmt.Errorf("duckdb CLI not found in PATH")
 	}
-	cmd := exec.CommandContext(ctx, c.cliPath, "-json", "-c", c.Config.quackQuerySQL(sql))
+	cmd := c.serverInvocation(sql, "-json").command(ctx, c.cliPath)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		if trimmed := strings.TrimSpace(string(out)); trimmed != "" {
 			return fmt.Errorf("%s", trimmed)
@@ -969,8 +1012,7 @@ func (c *QuackClient) fetchDuckLakeSnapshots(ctx context.Context, idx int) tea.M
 	// default schema, expanding to ducklake_snapshots('_lake'); either spelling
 	// works once ATTACH ... AS _lake has run.
 	sql := "SELECT snapshot_id, snapshot_time, schema_version FROM _lake.snapshots() ORDER BY snapshot_id DESC LIMIT 5;"
-	cmd := exec.CommandContext(ctx, c.cliPath, c.cliArgs(sql, "-json")...)
-	out, err := cmd.Output()
+	out, err := c.invocation(sql, "-json").command(ctx, c.cliPath).Output()
 	if err != nil {
 		// Report the failure. This used to substitute a synthetic "lake" row,
 		// which made a missing ducklake extension or an unreachable catalog
@@ -1139,8 +1181,7 @@ func (c *QuackClient) FetchCatalogCmd(idx int) tea.Cmd {
 			     WHERE database_name = current_database() AND NOT internal
 			    ORDER BY table_schema, table_name;`
 
-		cmd := exec.CommandContext(ctx, c.cliPath, c.cliArgs(sql, "-json")...)
-		out, err := cmd.Output()
+		out, err := c.invocation(sql, "-json").command(ctx, c.cliPath).Output()
 		if err != nil {
 			// stderr carries the Binder/Catalog error; "exit status 1" alone
 			// left the panel saying nothing useful.

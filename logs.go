@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os/exec"
 	"strings"
 	"time"
 
@@ -118,8 +117,7 @@ func (v LogsView) FetchCmd() tea.Cmd {
 		if !c.HasCLI() {
 			return logsResultMsg{idx: idx, err: fmt.Errorf("duckdb CLI not found in PATH")}
 		}
-		cmd := exec.CommandContext(ctx, c.cliPath, "-json", "-c", c.Config.quackQuerySQL(logSQL))
-		out, err := cmd.Output()
+		out, err := c.serverInvocation(logSQL, "-json").command(ctx, c.cliPath).Output()
 		if err != nil {
 			return logsResultMsg{idx: idx, err: fmt.Errorf("%s", cliError(err))}
 		}

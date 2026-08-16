@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"io"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -154,7 +155,7 @@ func TestGeneratedSQLEscapesQuotes(t *testing.T) {
 // The prologue has to reach the CLI for every connection type. Local
 // connections used to drop it, so a local path with a storage_secret_ref never
 // created its secret.
-func TestCLIArgs(t *testing.T) {
+func TestInvocation(t *testing.T) {
 	s3 := StorageSecret{Name: "lake_s3", Type: SecretS3, KeyID: "AKIA", Secret: "shh"}
 
 	tests := []struct {
@@ -191,29 +192,127 @@ func TestCLIArgs(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			c := NewQuackClient(tc.cfg, nil, secretResolverFor(s3))
-			args := c.cliArgs("SELECT 1", "-json")
+			inv := c.invocation("SELECT 1", "-json")
 
 			if tc.wantPosition != "" {
-				if args[0] != tc.wantPosition {
-					t.Fatalf("argv[0] = %q, want %q (full: %v)", args[0], tc.wantPosition, args)
+				if inv.Args[0] != tc.wantPosition {
+					t.Fatalf("argv[0] = %q, want %q (full: %v)", inv.Args[0], tc.wantPosition, inv.Args)
 				}
-			} else if args[0] != "-json" {
-				t.Fatalf("argv[0] = %q, want the flags to come first (full: %v)", args[0], args)
+			} else if inv.Args[0] != "-no-init" {
+				t.Fatalf("argv[0] = %q, want the base flags to come first (full: %v)", inv.Args[0], inv.Args)
 			}
 
-			if args[len(args)-2] != "-c" {
-				t.Fatalf("expected -c before the script, got %v", args)
+			// The script goes on stdin. Nothing resembling SQL belongs in argv:
+			// that is what keeps tokens out of /proc/<pid>/cmdline.
+			for _, a := range inv.Args {
+				if strings.Contains(a, "SELECT 1") || a == "-c" {
+					t.Errorf("script leaked into argv: %v", inv.Args)
+				}
 			}
-			script := args[len(args)-1]
-			if !strings.HasSuffix(script, "SELECT 1") {
-				t.Errorf("script does not end with the query: %q", script)
+			if !strings.HasSuffix(inv.Script, "SELECT 1") {
+				t.Errorf("script does not end with the query: %q", inv.Script)
 			}
 			for _, want := range tc.wantScriptIn {
-				if !strings.Contains(script, want) {
-					t.Errorf("script missing %q: %q", want, script)
+				if !strings.Contains(inv.Script, want) {
+					t.Errorf("script missing %q: %q", want, inv.Script)
 				}
 			}
 		})
+	}
+}
+
+// Every duckdb subprocess must skip the operator's ~/.duckdbrc and stop at the
+// first error. Without -no-init a .duckdbrc containing `ATTACH ':memory:' AS
+// _lake` breaks every DuckLake query; without -bail a script on stdin keeps
+// going after a failed ATTACH and runs the caller's query against the wrong
+// catalog, because unlike `-c` a piped script does not abort on error.
+func TestBaseCLIFlagsArePresentEverywhere(t *testing.T) {
+	cfg := ServerConfig{Name: "q", Type: ConnQuack, Host: "h", Port: 9494, Token: "sekret"}
+	c := NewQuackClient(cfg, nil, nil)
+
+	for _, tc := range []struct {
+		name string
+		inv  cliInvocation
+	}{
+		{"query invocation", c.invocation("SELECT 1", "-json")},
+		{"query invocation without flags", c.invocation("COPY (SELECT 1) TO 'x'")},
+		{"server invocation", c.serverInvocation("SELECT 1", "-json")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, want := range []string{"-no-init", "-bail"} {
+				found := false
+				for _, a := range tc.inv.Args {
+					if a == want {
+						found = true
+					}
+				}
+				if !found {
+					t.Errorf("argv is missing %s: %v", want, tc.inv.Args)
+				}
+			}
+		})
+	}
+}
+
+// A bearer token and object-store credentials must never appear in argv, where
+// any process on the machine can read them out of /proc/<pid>/cmdline. They
+// belong in the script, which travels on stdin.
+func TestCredentialsNeverReachArgv(t *testing.T) {
+	const token = "tok-must-not-leak"
+	const key = "AKIA-must-not-leak"
+	const secret = "s3cret-must-not-leak"
+
+	s3 := StorageSecret{Name: "lake_s3", Type: SecretS3, KeyID: key, Secret: secret}
+	resolve := secretResolverFor(s3)
+
+	cases := map[string]ServerConfig{
+		"quack token": {Name: "q", Type: ConnQuack, Host: "h", Port: 9494, Token: token},
+		"local with storage secret": {
+			Name: "l", Type: ConnLocal, Path: "/d/a.duckdb", StorageSecretRef: "lake_s3",
+		},
+		"ducklake with storage secret": {
+			Name: "dl", Type: ConnDuckLake, CatalogPath: "/d/c.duckdb",
+			StoragePath: "s3://b/d", StorageSecretRef: "lake_s3",
+		},
+	}
+
+	for name, cfg := range cases {
+		t.Run(name, func(t *testing.T) {
+			c := NewQuackClient(cfg, nil, resolve)
+			invs := []cliInvocation{
+				c.invocation("SELECT 1", "-json"),
+				c.serverInvocation("SELECT 1", "-json"),
+			}
+			for _, inv := range invs {
+				for _, a := range inv.Args {
+					for _, bad := range []string{token, key, secret} {
+						if strings.Contains(a, bad) {
+							t.Errorf("credential %q found in argv: %v", bad, inv.Args)
+						}
+					}
+				}
+			}
+		})
+	}
+}
+
+// The command must actually wire the script to stdin — an invocation whose
+// script never reaches the process would run an empty script and silently
+// return nothing.
+func TestInvocationCommandWiresStdin(t *testing.T) {
+	c := NewQuackClient(ServerConfig{Type: ConnQuack, Host: "h", Port: 9494}, nil, nil)
+	inv := c.invocation("SELECT 1", "-json")
+	cmd := inv.command(context.Background(), "/nonexistent/duckdb")
+
+	if cmd.Stdin == nil {
+		t.Fatal("command has no stdin; the script would never reach duckdb")
+	}
+	got, err := io.ReadAll(cmd.Stdin)
+	if err != nil {
+		t.Fatalf("reading stdin: %v", err)
+	}
+	if string(got) != inv.Script {
+		t.Errorf("stdin = %q, want the invocation script %q", got, inv.Script)
 	}
 }
 
