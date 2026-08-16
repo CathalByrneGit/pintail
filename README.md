@@ -442,7 +442,7 @@ verified against:
 |-----------|---------|-----|
 | DuckDB CLI | `v1.5.5` (Variegata) | Queries run against a real binary — the integration tests do this in CI |
 | `quack` extension | installed for the pinned DuckDB | **CI starts a real server** with `quack_serve` and runs Pintail's own client against it |
-| `duckdb-quack` | `main` @ `7e80f7f` (2026-07-20) | Extension sources and its own test suite read for the wire protocol, ATTACH options, SSL defaults, and `quack_active_connections()` |
+| `duckdb-quack` | `main` @ `7e80f7f` (2026-07-20) | Extension sources and its own test suite read for the wire protocol, ATTACH options, SSL defaults, and `quack_active_connections()`. **Note the skew:** Pintail runs against whatever build is published for the pinned DuckDB, which is older than `main` — see below |
 | `ducklake` | `main` @ `3d8e24a` (2026-08-13) | Sources read for `snapshots()`, `AT (VERSION => …)` and `ducklake_expire_snapshots`; the snapshot listing is executed against a real lake in CI |
 | Quack docs | `docs/current/quack/*` | Overview, reference, security, and the reverse-proxy guide |
 
@@ -466,6 +466,18 @@ What that means concretely:
 The authorization screen's toggles compile to a statement-prefix regexp, which
 is **not** a security boundary — `WITH x AS (…) INSERT …` passes as a read. The
 screen says so, and DuckLake or a read-only ATTACH is the real mechanism.
+
+**On reading sources versus running them.** Those are not the same check, and
+the difference has bitten this project. `DISABLE_SSL` is a valid `ATTACH` option
+in duckdb-quack `main` — it went in with the commit pinned above — but not in the
+build published for DuckDB v1.5.5, which is what `INSTALL quack` actually gives
+you. Pintail emitted it on every Quack connection, so every Quack connection
+failed with `Binder Error: Unrecognized option for attach "disable_ssl"`. The
+source said the option existed; the extension people install disagreed. The
+`live-quack` job is there so the next such gap is found by CI rather than by
+you. Pintail now sends the option only when it differs from the extension's own
+default (plaintext for `localhost`/`127.0.0.1`/`::1`, SSL otherwise), so the
+common cases need no new-extension features at all.
 
 If you run Pintail against a newer Quack than the above and something breaks,
 the generated SQL in each screen is visible on screen for exactly that reason:
