@@ -235,8 +235,18 @@ query routing, and metadata fetch accordingly.
 | Type       | Use it for                          | Reachability                     | Query routing                                                                                                          |
 |------------|-------------------------------------|----------------------------------|------------------------------------------------------------------------------------------------------------------------|
 | `quack`    | Remote DuckDB via Quack             | `GET /` banner check             | `CREATE OR REPLACE SECRET … (TYPE quack, TOKEN '…', SCOPE 'quack:host:port'); ATTACH 'quack:host:port' AS _remote; USE _remote;` |
-| `local`    | Plain `.duckdb` file on disk        | `os.Stat(path)`                  | `duckdb <path> -json -c "<sql>"` (file opened directly via argv; a `storage_secret_ref` is prepended as `CREATE SECRET`) |
+| `local`    | Plain `.duckdb` file on disk        | `os.Stat(path)`                  | file opened directly via argv; a `storage_secret_ref` is prepended as `CREATE SECRET`                                   |
 | `ducklake` | DuckLake lakehouse                  | TCP dial of catalog host / stat  | `INSTALL ducklake; LOAD ducklake; ATTACH 'ducklake:…' AS _lake (DATA_PATH '…'); USE _lake;`                            |
+
+Every invocation is `duckdb -no-init -bail -json` with the script on **stdin**,
+never `-c`. See [Architecture notes](#architecture-notes) for why.
+
+For a `quack` backend the *metadata* queries — catalog, sessions, message log,
+the authorization hook — do not go through that ATTACH at all. They are sent
+with `quack_query` so the **server** evaluates them, because `duckdb_tables()`,
+`quack_active_connections()` and `duckdb_logs_parsed()` all describe whichever
+process runs them. Asked through our own attached session they describe the
+local CLI, which is how the catalog panel came back empty against a real server.
 
 ### DuckLake catalog via another connection (multi-writer pattern)
 
@@ -360,9 +370,22 @@ requests that carry it. Failed messages are highlighted, and the panel below
 shows the selected entry in full — including the error, which has no column.
 
 Logging is **off until it is turned on**, and turning it on changes state on
-someone's server, so Pintail never does it as part of a poll: press `e` to run
-`CALL enable_logging('Quack')` on the target, then `r` to refresh. Pintail's own
-log-reading query is filtered out of the results.
+someone's server, so Pintail never does it as part of a poll: press `e`. That
+runs
+
+```sql
+CALL enable_logging('Quack', storage = 'memory');
+```
+
+and reads the log back in the same round trip, so the panel fills immediately
+rather than needing a follow-up refresh. Pintail's own log-reading query is
+filtered out of the results.
+
+`storage = 'memory'` is load-bearing, not decoration. In the duckdb CLI the
+default log storage is the **console**: the call succeeds, the server prints its
+log lines to its own stdout, and `duckdb_logs` stays empty — so the panel would
+sit at "no entries" forever while exactly the rows it wanted scrolled past on
+the server's terminal.
 
 If the fetch fails with `structured_log_schema: 'Quack' not found`, the log type
 is not registered on that instance — it appears once the `quack` extension is
@@ -370,11 +393,18 @@ loaded there.
 
 ### Scratchpad export
 
-After running a query, `ctrl+e` opens an export prompt: `c` writes CSV
-from in-memory rows (no external tools), `p` re-executes through
-`duckdb -c "COPY (…) TO '…' (FORMAT PARQUET);"`. Files land in
-`~/.duckdb/exports/pintail-{YYYYMMDD-HHMMSS}.{csv|parquet}`. Designed
-for audit trails — capture the result of a permission change or a
+After running a query, `ctrl+e` opens an export prompt. The two formats are
+not the same operation, and the prompt labels them accordingly: `c` writes CSV
+from the **rows on screen** (no external tools), while `p` **re-runs the query**
+on the backend through `COPY (…) TO '…' (FORMAT PARQUET)`. For a table being
+written to concurrently those return different data.
+
+Files land in `~/.duckdb/exports/pintail-{YYYYMMDD-HHMMSS}.{csv|parquet}`,
+written `0600` — an export holds whatever the query returned. A name already
+taken gains a `-2`, `-3` suffix rather than overwriting, since the timestamp
+only has second resolution and the two export keys are adjacent.
+
+Designed for audit trails — capture the result of a permission change or a
 post-rollback row count, not for analytical workflows.
 
 ### Connection manager
@@ -457,6 +487,13 @@ What that means concretely:
   `duckdb_logs_parsed('Quack')`, the authorization hook's read-back / install /
   `RESET GLOBAL` cycle, and rejection of a wrong token. CI fails if any of
   these silently skip, so "passing" cannot mean "tested nothing".
+
+  Its first runs found four bugs, none of which any amount of reading had
+  caught: `TOKEN` and `DISABLE_SSL` rejected as `ATTACH` options by the released
+  extension, the catalog panel empty because `duckdb_tables()` was being asked
+  of the wrong process, and the message log permanently empty because
+  `enable_logging` defaults to console storage. All four broke a headline
+  feature outright. If you take one thing from this file, take that.
 - **Executed against DuckDB 1.5.5**: the catalog query (`duckdb_tables()` /
   `duckdb_views()`), the session-facts query, DuckLake snapshot listing and
   time-travel SQL, Parquet export, and the scratchpad's own error and
@@ -542,8 +579,21 @@ running them locally. CI (`.github/workflows/ci.yml`) installs a pinned DuckDB,
 runs `gofmt`/`vet`/`staticcheck`/`build`/`test -race` against the Go floor and
 current stable, and fails if the integration tests silently skipped.
 
-Three kinds of test carry most of the weight:
+Four kinds of test carry most of the weight:
 
+- **Against a real Quack server** (the `live-quack` CI job). A server is started
+  with `quack_serve` and Pintail's own client is pointed at it. This is the one
+  that finds protocol mistakes, and it found several the moment it existed — see
+  [Verified against](#verified-against). To run it against your own server:
+
+  ```bash
+  PINTAIL_TEST_QUACK_HOST=127.0.0.1 \
+  PINTAIL_TEST_QUACK_PORT=9494 \
+  PINTAIL_TEST_QUACK_TOKEN=… \
+    go test -run TestLive -v ./internal/quack/
+  ```
+
+  Without those variables the tests skip, and CI fails if they do.
 - **`internal/quack` against a real `duckdb`.** Generated SQL is only as good
   as the functions it names, and unit tests cannot tell you that
   `duckdb_connections()` does not exist. These run the real statements.
@@ -690,6 +740,9 @@ Done:
 - ✅ DuckLake snapshots panel with correct time-travel / expire SQL
 - ✅ CLI subcommands with `--json`
 - ✅ Live ping dashboard, token manager, TLS config, auth policy editor
+- ✅ Quack message-log screen
+- ✅ **Verified against a running Quack server in CI**, not only against the
+  extension's sources
 
 Possible next steps:
 - Run `ducklake_expire_snapshots` / time-travel SELECT directly from the snapshots screen (currently SQL-only)
