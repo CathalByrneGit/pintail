@@ -554,29 +554,53 @@ Other files written under `~/.duckdb/`:
 
 ```
 pintail/
-├── main.go        — entry point + CLI subcommands (list/ping/query)
-├── data.go        — domain types, mock fallback data, tick command
-├── styles.go      — Lip Gloss palette and shared styles
-├── client.go      — QuackClient: type-aware ping/query, secrets/catalog resolvers, config I/O
-├── model.go       — root Bubble Tea model, view routing, screen layouts
-├── scratchpad.go  — quick-check SQL editor, async query, CSV/Parquet export
-├── tokens.go      — Quack token manager (mode 1 of the secrets screen)
-├── secrets.go     — Storage secret manager (mode 2 of the secrets screen)
-├── ducklake.go    — snapshots view, time-travel / expire-snapshots SQL
-├── logs.go        — Quack message-log view
-├── tls.go         — Caddy / Nginx / Envoy config generators
-├── auth.go        — permission grid + Quack authorization-hook generator
-├── version.go     — version string, stampable with -ldflags
-└── .github/workflows/ci.yml — fmt / vet / build / test -race, with a real duckdb
+├── main.go                     — entry point: dispatch to the TUI or a subcommand
+├── internal/quack/             — the data layer. Talks to duckdb, generates SQL,
+│   │                             parses results. Imports no terminal library, and
+│   │                             a test enforces that (boundary_test.go).
+│   ├── client.go               — QuackClient: type-aware ping/query, the duckdb
+│   │                             invocation (argv + stdin), config and token I/O
+│   ├── types.go                — Connection, ServerInfo, Catalog*, QueryResult
+│   ├── ducklake.go             — snapshot listing, time-travel / expire SQL
+│   ├── logs.go                 — Quack message log: schema, query, parser
+│   └── tokens.go               — the bearer-credential model
+├── internal/ui/                — the screens. Bubble Tea sub-models.
+│   ├── model.go                — root model, view routing, screen layouts
+│   ├── commands.go             — the tea.Cmd wrappers and result messages that
+│   │                             carry the client's values into the update loop
+│   ├── scratchpad.go           — SQL editor, async query, CSV/Parquet export
+│   ├── tokens.go / secrets.go  — token manager, storage-secret manager
+│   ├── ducklake.go / logs.go   — snapshots view, message-log view
+│   ├── tls.go                  — Caddy / Nginx / Envoy config generators
+│   ├── auth.go                 — permission grid + authorization-hook generator
+│   ├── data.go / styles.go     — tick command, Lip Gloss palette
+├── internal/cli/               — list / ping / query, writing through an injected
+│                                 io.Writer so the output is testable
+├── internal/version/           — version string, stampable with -ldflags
+├── testdata/                   — fixtures shared between packages
+└── .github/workflows/ci.yml    — fmt / vet / staticcheck / build / test -race,
+                                  against a real duckdb and a live Quack server
 ```
 
 ## Architecture notes
 
 - **Elm architecture** — each screen is a sub-model with its own
   `Update`/`View`; the root `Model` routes messages and composes layouts.
+- **The data layer knows nothing about the terminal** — `internal/quack`
+  exposes synchronous, `context`-taking methods that return values and
+  errors. The `tea.Cmd` wrappers and result messages live in
+  `internal/ui/commands.go`. This is enforced by a test rather than left
+  to discipline: before the split everything was `package main` and the
+  client returned Bubble Tea messages directly.
 - **All I/O async** — pings, queries, snapshot fetches, and metadata
   polls run as `tea.Cmd` goroutines and deliver typed messages back to
   the update loop. The UI never blocks.
+- **Credentials never reach argv** — the SQL script, which carries the
+  bearer token and any object-store secret, is fed to `duckdb` on stdin.
+  argv would be readable from `/proc/<pid>/cmdline` by any process on the
+  box. Every invocation also passes `-no-init` (so the operator's
+  `~/.duckdbrc` cannot break Pintail's prologue) and `-bail` (a piped
+  script does not stop at the first error on its own).
 - **Catalog-ref resolution via injected closure** — each `QuackClient`
   holds a `ConfigResolver` (closure over `[]ServerConfig`). DuckLake's
   `AttachPrefix` uses it to look up `CatalogRef` at query time.
