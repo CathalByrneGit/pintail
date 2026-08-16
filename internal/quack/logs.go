@@ -93,7 +93,26 @@ func (c *QuackClient) Logs(ctx context.Context) ([]LogEntry, error) {
 	return ParseLogRows(out)
 }
 
-// EnableLogging turns Quack logging on for the server.
-func (c *QuackClient) EnableLogging(ctx context.Context) error {
-	return c.RunServerSQL(ctx, "CALL enable_logging('Quack')")
+// EnableLogging turns Quack logging on for the server, and returns the entries
+// visible immediately afterwards.
+//
+// Enabling and reading are one statement on purpose. Every quack_query is a
+// fresh connection that disconnects when it returns, and against a real server
+// enabling on one connection and reading on the next produced no entries at all
+// — the live-Quack job reported "no log entries after enabling logging and
+// running a query". Sending both together means the read happens while the
+// connection that enabled it is still open, whatever the scope of the setting
+// turns out to be.
+func (c *QuackClient) EnableLogging(ctx context.Context) ([]LogEntry, error) {
+	if !c.hasCLI {
+		return nil, fmt.Errorf("duckdb CLI not found in PATH")
+	}
+	sql := "CALL enable_logging('Quack'); " + logSQL
+	out, err := c.serverInvocation(sql, "-json").command(ctx, c.cliPath).Output()
+	if err != nil {
+		return nil, fmt.Errorf("%s", cliError(err))
+	}
+	// lastJSONArray takes the SELECT's output rather than whatever enable_logging
+	// printed, so the CALL in front is harmless.
+	return ParseLogRows(out)
 }

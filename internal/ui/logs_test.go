@@ -141,12 +141,20 @@ func TestLogsViewEnableOutcome(t *testing.T) {
 		quack.NewQuackClient(quack.ServerConfig{Name: "quack-a", Type: quack.ConnQuack, Host: "h", Port: 9494}, nil, nil),
 	})
 
-	v, cmd := v.Update(logsEnabledMsg{target: "quack-a"})
+	// Enabling carries the entries back with it, so the screen shows them
+	// rather than issuing a second fetch on a fresh connection.
+	v, cmd := v.Update(logsEnabledMsg{
+		target:  "quack-a",
+		entries: []quack.LogEntry{{MessageType: "PREPARE_REQUEST", Query: "SELECT 1"}},
+	})
 	if v.noticeErr || !strings.Contains(v.notice, "logging enabled on quack-a") {
 		t.Errorf("notice = %q (err=%v)", v.notice, v.noticeErr)
 	}
-	if cmd == nil {
-		t.Error("a successful enable should refresh the log")
+	if cmd != nil {
+		t.Error("the entries came with the message; no second fetch is needed")
+	}
+	if len(v.entries) != 1 {
+		t.Errorf("got %d entries, want the one that came with the message", len(v.entries))
 	}
 	if !strings.Contains(v.ViewTargetBar(), "logging enabled") {
 		t.Error("the target bar should show the notice")

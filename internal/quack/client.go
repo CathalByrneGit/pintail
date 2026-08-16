@@ -1274,7 +1274,18 @@ func (c *QuackClient) Catalog(ctx context.Context) ([]CatalogSchema, error) {
 			     WHERE database_name = current_database() AND NOT internal
 			    ORDER BY table_schema, table_name;`
 
-	out, err := c.invocation(sql, "-json").command(ctx, c.cliPath).Output()
+	// A Quack backend has to enumerate its own catalog, for the same reason the
+	// session list does: duckdb_tables() and duckdb_views() describe the process
+	// that evaluates them. Through an ATTACH they report the local CLI's
+	// databases, and current_database() is the alias we attached under, so the
+	// filter matched nothing and the panel came back empty against a real
+	// server — `Catalog: empty`, found by the live-Quack job.
+	inv := c.invocation(sql, "-json")
+	if c.Config.Type == ConnQuack {
+		inv = c.serverInvocation(sql, "-json")
+	}
+
+	out, err := inv.command(ctx, c.cliPath).Output()
 	if err != nil {
 		// stderr carries the Binder/Catalog error; "exit status 1" alone
 		// left the panel saying nothing useful.

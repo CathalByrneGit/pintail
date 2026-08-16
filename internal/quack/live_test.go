@@ -195,21 +195,29 @@ func TestLiveLogging(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()
 
-	if err := c.EnableLogging(ctx); err != nil {
+	// Enabling returns what is visible immediately afterwards, on the same
+	// connection. Anything Pintail has already sent this server is in there.
+	entries, err := c.EnableLogging(ctx)
+	if err != nil {
 		t.Fatalf("EnableLogging: %v", err)
 	}
 
-	// Generate traffic for the log to record.
+	// Generate more traffic and read again. A separate quack_query is a new
+	// connection, so this also tells us whether the setting outlives the
+	// connection that set it.
 	if res := c.Query(ctx, "SELECT 'log me' AS marker;"); res.Err != "" {
 		t.Fatalf("generating traffic: %s", res.Err)
 	}
-
-	entries, err := c.Logs(ctx)
+	later, err := c.Logs(ctx)
 	if err != nil {
 		t.Fatalf("Logs: %v", err)
 	}
+	if len(later) > 0 {
+		entries = later
+	}
+
 	if len(entries) == 0 {
-		t.Fatal("no log entries after enabling logging and running a query")
+		t.Fatal("no log entries either on the enabling connection or a later one")
 	}
 
 	// The ORDER BY timestamp in logSQL only works if that column exists, so

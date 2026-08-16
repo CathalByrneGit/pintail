@@ -19,10 +19,13 @@ type logsResultMsg struct {
 	err     error
 }
 
-// logsEnabledMsg is the result of turning logging on for a server.
+// logsEnabledMsg is the result of turning logging on for a server. It carries
+// the entries visible right after enabling, because enabling and reading happen
+// in one server round trip.
 type logsEnabledMsg struct {
-	target string
-	err    string
+	target  string
+	entries []quack.LogEntry
+	err     string
 }
 
 // LogsView is the Quack message-log screen.
@@ -103,10 +106,11 @@ func (v LogsView) EnableCmd() tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		if err := c.EnableLogging(ctx); err != nil {
+		entries, err := c.EnableLogging(ctx)
+		if err != nil {
 			return logsEnabledMsg{target: c.Config.Name, err: firstLine(err.Error())}
 		}
-		return logsEnabledMsg{target: c.Config.Name}
+		return logsEnabledMsg{target: c.Config.Name, entries: entries}
 	}
 }
 
@@ -135,8 +139,15 @@ func (v LogsView) Update(msg tea.Msg) (LogsView, tea.Cmd) {
 		}
 		v.notice = "logging enabled on " + msg.target
 		v.noticeErr = false
-		v.loading = true
-		return v, v.FetchCmd()
+		// The entries from the enabling round trip are already here, so show
+		// them rather than issuing a second fetch that would arrive on a new
+		// connection.
+		v.entries = msg.entries
+		if v.cursor >= len(v.entries) {
+			v.cursor = 0
+		}
+		v.loading = false
+		return v, nil
 
 	case tea.KeyMsg:
 		switch msg.String() {
