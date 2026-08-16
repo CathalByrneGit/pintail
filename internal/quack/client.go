@@ -945,19 +945,47 @@ func (c *QuackClient) probeQuackHTTP(ctx context.Context) (confirmed bool, err e
 // the last array specifically, not the last non-empty one: a query that
 // legitimately returns no rows must not be reported as the prologue's output.
 func lastJSONArray(data []byte) []byte {
-	dec := json.NewDecoder(bytes.NewReader(data))
+	if span := lastJSONArraySpan(data); span != nil {
+		return span
+	}
+	return data // nothing parseable: hand it back so the caller can report it
+}
+
+// lastJSONArraySpan finds the last JSON array in data, ignoring anything around
+// it that is not JSON.
+//
+// A decoder anchored at offset 0 is not enough. The output is not necessarily
+// JSON from the start: `CALL enable_logging(...)` prints a multi-line WARNING to
+// stdout both before and after the result arrays, and a server logging to its
+// console interleaves log lines with replies. A decoder stops at the first byte
+// that is not JSON and never reaches the arrays.
+//
+// Bracket counting is not enough either, because that noise is ANSI-coloured
+// and an escape sequence like "\x1b[90m" contributes an opening bracket with no
+// closing one, so a depth counter never returns to zero and every real array is
+// swallowed inside a span that started in the noise.
+//
+// So: try to decode a JSON value at each '[' and keep the last one that both
+// decodes and is an array. Candidates that are noise fail immediately.
+func lastJSONArraySpan(data []byte) []byte {
 	var last []byte
-	for {
+	for i := 0; i < len(data); i++ {
+		if data[i] != '[' {
+			continue
+		}
+		dec := json.NewDecoder(bytes.NewReader(data[i:]))
 		var raw json.RawMessage
 		if err := dec.Decode(&raw); err != nil {
-			break
+			continue
 		}
-		if trimmed := bytes.TrimSpace(raw); len(trimmed) > 0 && trimmed[0] == '[' {
-			last = trimmed
+		trimmed := bytes.TrimSpace(raw)
+		if len(trimmed) == 0 || trimmed[0] != '[' {
+			continue
 		}
-	}
-	if last == nil {
-		return data // unparseable: hand it back so the caller can report it
+		last = trimmed
+		// Skip past what was just consumed; a nested array inside this one is
+		// not a separate statement's output.
+		i += int(dec.InputOffset()) - 1
 	}
 	return last
 }

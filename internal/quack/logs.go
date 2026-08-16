@@ -77,6 +77,21 @@ func ParseLogRows(data []byte) ([]LogEntry, error) {
 // same reason.
 const logSQL = `SELECT * FROM duckdb_logs_parsed('Quack') ORDER BY timestamp DESC LIMIT 200`
 
+// enableLoggingSQL turns Quack logging on with a storage the log can be read
+// back from.
+//
+// storage = 'memory' is the whole point. In the duckdb CLI the default log
+// storage is the console: enable_logging succeeds, the process prints its log
+// lines to stdout, and duckdb_logs stays empty. Pintail sent the bare call, so
+// pressing [e] reported success and the panel then sat at "no entries" forever
+// while the server's own stdout filled up with exactly the rows that should
+// have been on screen. The live-Quack job reported it as "no log entries
+// either on the enabling connection or a later one".
+//
+// Confirmed against v1.5.5: `CALL enable_logging(); SELECT 1; SELECT count(*)
+// FROM duckdb_logs` gives 0, and the same with storage = 'memory' gives 1.
+const enableLoggingSQL = `CALL enable_logging('Quack', storage = 'memory')`
+
 // Logs reads the Quack message log from inside the server process.
 //
 // The log lives on the server, so this goes through quack_query the same way the
@@ -107,7 +122,7 @@ func (c *QuackClient) EnableLogging(ctx context.Context) ([]LogEntry, error) {
 	if !c.hasCLI {
 		return nil, fmt.Errorf("duckdb CLI not found in PATH")
 	}
-	sql := "CALL enable_logging('Quack'); " + logSQL
+	sql := enableLoggingSQL + "; " + logSQL
 	out, err := c.serverInvocation(sql, "-json").command(ctx, c.cliPath).Output()
 	if err != nil {
 		return nil, fmt.Errorf("%s", cliError(err))

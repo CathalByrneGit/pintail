@@ -2,7 +2,9 @@ package quack
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -84,4 +86,62 @@ func quackLogRows(t *testing.T) []byte {
 		t.Fatalf("reading the log fixture: %v", err)
 	}
 	return data
+}
+
+// The log screen is only useful if the entries can be read back, and in the
+// duckdb CLI the default log storage is the console: enable_logging succeeds,
+// the process prints its log lines to stdout, and duckdb_logs stays empty. This
+// pins both reasons the statement names a storage, against the real binary.
+func TestEnableLoggingUsesAReadableStorageAgainstRealDuckDB(t *testing.T) {
+	if _, err := exec.LookPath("duckdb"); err != nil {
+		t.Skip("duckdb not in PATH")
+	}
+
+	run := func(enable string) (rows int, raw string, err error) {
+		sql := enable + "; SELECT 1 AS x; SELECT count(*) AS n FROM duckdb_logs;"
+		out, cmdErr := exec.Command("duckdb", "-no-init", "-json", "-c", sql).Output()
+		if cmdErr != nil {
+			return 0, string(out), cmdErr
+		}
+		n, parseErr := firstStringValue(out, "n")
+		if parseErr != nil {
+			return 0, string(out), parseErr
+		}
+		v, convErr := strconv.Atoi(n)
+		return v, string(out), convErr
+	}
+
+	// The bare call is what Pintail used to send. Two things go wrong with it,
+	// and either one is enough to make the panel useless.
+	rows, raw, err := run("CALL enable_logging()")
+	switch {
+	case err != nil:
+		// The console storage writes log lines into stdout, which is the same
+		// stream the -json results arrive on — so the output stops being
+		// parseable at all. Worth knowing: it means a server logging to its
+		// console corrupts every reply Pintail reads from it.
+		if !strings.Contains(raw, "logging settings have been changed") {
+			t.Errorf("unexpected failure for the bare call: %v\n%s", err, raw)
+		}
+	case rows == 0:
+		// Parsed fine, but the log is empty: the entries went to the console.
+	default:
+		t.Logf("the bare call yielded %d readable rows on this build", rows)
+	}
+
+	// Naming a queryable storage is what makes the panel possible, and keeps
+	// stdout clean enough to parse.
+	rows, raw, err = run("CALL enable_logging(storage = 'memory')")
+	if err != nil {
+		t.Fatalf("storage = 'memory' should parse cleanly: %v\n%s", err, raw)
+	}
+	if rows == 0 {
+		t.Error("with storage = 'memory' the log must be readable from duckdb_logs")
+	}
+
+	// And the statement Pintail actually sends has to name one.
+	if !strings.Contains(enableLoggingSQL, "storage") {
+		t.Errorf("enableLoggingSQL does not name a storage, so the log will be unreadable: %s",
+			enableLoggingSQL)
+	}
 }

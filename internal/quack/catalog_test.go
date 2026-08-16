@@ -337,3 +337,73 @@ func TestAllParsersSkipPrologueOutput(t *testing.T) {
 		}
 	})
 }
+
+// duckdb's -json output is not necessarily JSON from the first byte.
+// `CALL enable_logging(...)` prints an ANSI-coloured WARNING to stdout both
+// before and after the result arrays, and a server logging to its console
+// interleaves log lines with replies. A decoder anchored at offset 0 stops at
+// the first non-JSON byte and never reaches the arrays; bracket counting fails
+// too, because an escape sequence like "\x1b[90m" opens a bracket that never
+// closes.
+//
+// This is the real output from `CALL enable_logging(storage = 'memory');
+// SELECT 1 AS x; SELECT count(*) AS n FROM duckdb_logs;` on v1.5.5.
+func TestParserToleratesConsoleNoiseAroundTheArrays(t *testing.T) {
+	const noisy = "\x1b[90mWARNING:\n" +
+		"\x1b[00m\x1b[90mThe logging settings have been changed so you may lose warnings printed in the CLI.\n" +
+		"To continue printing warnings to the console, set storage='shell_log_storage'.\n" +
+		"For more info see https://duckdb.org/docs/stable/operations_manual/logging/overview.\n\n" +
+		"\x1b[00m[]\n" +
+		"[{\"x\":1}]\n" +
+		"[{\"n\":1}]\n" +
+		"\x1b[90mWARNING:\n" +
+		"\x1b[00m\x1b[90mThe logging settings have been changed so you may lose warnings printed in the CLI.\n"
+
+	got := lastJSONArray([]byte(noisy))
+	if string(got) != `[{"n":1}]` {
+		t.Fatalf("lastJSONArray = %q, want the last statement's array", got)
+	}
+
+	// And through the row parser the caller actually uses.
+	n, err := firstStringValue([]byte(noisy), "n")
+	if err != nil {
+		t.Fatalf("firstStringValue: %v", err)
+	}
+	if n != "1" {
+		t.Errorf("n = %q, want 1", n)
+	}
+}
+
+// An array is still found when the noise is only leading, only trailing, or
+// absent, and a genuinely empty result is not mistaken for the statement before
+// it.
+func TestLastJSONArrayCases(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"plain", `[{"a":1}]`, `[{"a":1}]`},
+		{"two statements", "[{\"Success\":true}]\n[{\"a\":1}]", `[{"a":1}]`},
+		{"leading noise", "Loading resources from x\n[{\"a\":1}]", `[{"a":1}]`},
+		{"trailing noise", "[{\"a\":1}]\nWARNING: something", `[{"a":1}]`},
+		{"ansi noise", "\x1b[90mnote\x1b[00m[{\"a\":1}]", `[{"a":1}]`},
+		// A statement that legitimately returns nothing must win over the one
+		// before it, or "no rows" is reported as the prologue's output.
+		{"empty last", "[{\"Success\":true}]\n[]", `[]`},
+		{"nested arrays are not separate statements", `[{"a":[1,2]}]`, `[{"a":[1,2]}]`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := string(lastJSONArray([]byte(tc.in))); got != tc.want {
+				t.Errorf("lastJSONArray(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+
+	// Nothing parseable comes back untouched so the caller can report it.
+	const junk = "Catalog Error: nope"
+	if got := string(lastJSONArray([]byte(junk))); got != junk {
+		t.Errorf("unparseable input = %q, want it returned as-is", got)
+	}
+}
